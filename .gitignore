@@ -1,5 +1,5 @@
 node_modules/
 lib/
-client/
+/client/
 *.tgz
 .dsh-edit-review*.json
