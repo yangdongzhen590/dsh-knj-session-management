@@ -1,0 +1,20 @@
+# dsh-knj-session-management bundle patch
+#
+# Installed through:
+#   dsh plugin --profile <name> add dsh-knj-session-management
+#
+# The command appends `dsh-knj-session-management` to the profile's dsh.profile.bundles
+# stack; the profile boot then merges THIS patch (a single insert of the
+# plugin row) exactly like a manual cordis.patch.yml mount line.
+- insert:
+    - id: dsh-knj-session-management
+      name: 'dsh-knj-session-management'
+      config:
+        # Keep the most recent N sessions per workspace (auto-policy).
+        # Set to 0 to disable auto-archive entirely.
+        maxSessionsPerWorkspace: 60
+        enabled: true
+        # Cap sessions archived per policy run (bounds event-loop blocking).
+        maxPerRun: 50
+        # Archive root; default: $DSH_HOME/archive-sessions.
+        # archiveRoot: ''
