@@ -9,6 +9,7 @@ import * as api from './api.ts'
 import type { ArchiveRecordView, SessionRowView, SessionListResponse, StatsView, WorkspaceGroupView } from './api.ts'
 import { DISTILL_TRIGGER } from './distill.ts'
 import { IconArchive, IconClose, IconFolder, IconRefresh, IconRestore, IconTrash, IconWand } from './icons.tsx'
+import { syncHostLists } from '../client-sync.ts'
 
 type Tab = 'current' | 'archived'
 type ToastState = { kind: 'ok' | 'warn' | 'err'; text: string } | null
@@ -24,11 +25,15 @@ export interface ArchivePanelProps {
 export interface SessionsService {
   open(id: string): void
   list?: { getSnapshot(): { byId: Record<string, { cwd?: string }>; current?: string } }
+  /** Concrete-runtime extra: re-pull the session list (see client-sync.ts). */
+  refresh?(): Promise<void> | void
 }
 
 /** The subset of the host `workspaces` client service this plugin touches. */
 export interface WorkspacesService {
   list?: { getSnapshot(): { items: Array<{ workspaceId: string; path: string; title?: string }> } }
+  /** Concrete-runtime extra: re-pull the workspace baseline (see client-sync.ts). */
+  refresh?(): Promise<void> | void
 }
 
 const PAGE_SIZE = 50
@@ -182,6 +187,16 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
     }
   }, [onClose, sessions, showToast])
 
+  /**
+   * Re-pull the host client baselines after any mutation batch. The plugin
+   * moves session files behind the host's back, so without this the left
+   * sidebar keeps ghost rows until the next reconnect (the host re-scans
+   * persistence on every list RPC, so a re-pull converges immediately).
+   */
+  const syncSidebar = useCallback(() => {
+    syncHostLists([sessions, workspaces])
+  }, [sessions, workspaces])
+
   /** Copy the wiki-distill trigger to the clipboard (fail-soft to a hint). */
   const copyDistill = useCallback(async (): Promise<boolean> => {
     try {
@@ -222,13 +237,14 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
         else showToast('warn', t('archive.partial', { count: done, skipped: skipped.length }))
         setSelected(new Set())
         await load()
+        if (done > 0) syncSidebar()
       } catch (error) {
         showToast('err', t('archive.failed', { reason: error instanceof Error ? error.message : String(error) }))
       } finally {
         setBusy(null)
       }
     },
-    [load, showToast, t, updateStats],
+    [load, showToast, syncSidebar, t, updateStats],
   )
 
   const doRestore = useCallback(
@@ -245,13 +261,14 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
         showToast('ok', t('restore.done', { count: done }))
         setArchivedSelected(new Set())
         await load()
+        if (done > 0) syncSidebar()
       } catch (error) {
         showToast('err', error instanceof Error ? error.message : String(error))
       } finally {
         setBusy(null)
       }
     },
-    [load, showToast, t, updateStats],
+    [load, showToast, syncSidebar, t, updateStats],
   )
 
   const doDelete = useCallback(
@@ -267,6 +284,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
         setArchivedSelected(new Set())
         setConfirmDelete(null)
         await load()
+        syncSidebar()
       } catch (error) {
         showToast('err', error instanceof Error ? error.message : String(error))
         setConfirmDelete(null)
@@ -274,7 +292,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
         setBusy(null)
       }
     },
-    [load, showToast, t, updateStats],
+    [load, showToast, syncSidebar, t, updateStats],
   )
 
   const doRunPolicy = useCallback(async () => {
@@ -285,13 +303,14 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
       showToast('ok', t('policy.done', { count: r.archived }))
       setPolicyPreview(null)
       await load()
+      if (r.archived > 0) syncSidebar()
     } catch (error) {
       showToast('err', error instanceof Error ? error.message : String(error))
       setPolicyPreview(null)
     } finally {
       setBusy(null)
     }
-  }, [load, policyPreview, showToast, t])
+  }, [load, policyPreview, showToast, syncSidebar, t])
 
   const stats = data?.stats
 

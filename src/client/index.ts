@@ -25,11 +25,22 @@ interface SlotsService {
 export interface SessionsService {
   open(id: string): void
   list?: { getSnapshot(): { byId: Record<string, { cwd?: string }>; current?: string } }
+  /**
+   * Concrete-runtime extra (public on SessionRuntime, not on the narrowed
+   * ISessions face): re-pull the host session list. The host pushes list
+   * frames only for sessions it changed itself, while this plugin moves
+   * session files on disk — without a re-pull the left sidebar keeps ghost
+   * rows until the next reconnect. Feature-detected at runtime; absent on
+   * narrowed test doubles, where sync is a no-op.
+   */
+  refresh?(): Promise<void> | void
 }
 
 /** The subset of the host `workspaces` client service this plugin touches. */
 export interface WorkspacesService {
   list?: { getSnapshot(): { items: Array<{ workspaceId: string; path: string; title?: string }> } }
+  /** Concrete-runtime extra (same feature-detect rule as sessions.refresh). */
+  refresh?(): Promise<void> | void
 }
 
 /** The client cordis context shape this plugin relies on (structural). */
