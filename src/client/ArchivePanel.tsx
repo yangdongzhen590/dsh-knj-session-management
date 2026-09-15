@@ -7,8 +7,9 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { Dict } from './locales.ts'
 import * as api from './api.ts'
 import type { ArchiveRecordView, SessionRowView, SessionListResponse, StatsView, WorkspaceGroupView } from './api.ts'
-import { DISTILL_TRIGGER } from './distill.ts'
+import { buildDistillTrigger } from './distill.ts'
 import { IconArchive, IconClose, IconFolder, IconRefresh, IconRestore, IconTrash, IconWand } from './icons.tsx'
+import { syncHostLists } from '../client-sync.ts'
 
 type Tab = 'current' | 'archived'
 type ToastState = { kind: 'ok' | 'warn' | 'err'; text: string } | null
@@ -24,11 +25,15 @@ export interface ArchivePanelProps {
 export interface SessionsService {
   open(id: string): void
   list?: { getSnapshot(): { byId: Record<string, { cwd?: string }>; current?: string } }
+  /** Concrete-runtime extra: re-pull the session list (see client-sync.ts). */
+  refresh?(): Promise<void> | void
 }
 
 /** The subset of the host `workspaces` client service this plugin touches. */
 export interface WorkspacesService {
   list?: { getSnapshot(): { items: Array<{ workspaceId: string; path: string; title?: string }> } }
+  /** Concrete-runtime extra: re-pull the workspace baseline (see client-sync.ts). */
+  refresh?(): Promise<void> | void
 }
 
 const PAGE_SIZE = 50
@@ -182,17 +187,70 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
     }
   }, [onClose, sessions, showToast])
 
-  /** Copy the wiki-distill trigger to the clipboard (fail-soft to a hint). */
-  const copyDistill = useCallback(async (): Promise<boolean> => {
+  /**
+   * Re-pull the host client baselines after any mutation batch. The plugin
+   * moves session files behind the host's back, so without this the left
+   * sidebar keeps ghost rows until the next reconnect (the host re-scans
+   * persistence on every list RPC, so a re-pull converges immediately).
+   */
+  const syncSidebar = useCallback(() => {
+    syncHostLists([sessions, workspaces])
+  }, [sessions, workspaces])
+
+  /**
+   * 选择集里存的是 `sessionId`（来自会话 header 的 id，归档 API 用的就是它），
+   * 而**提取器按会话目录名过滤**（`~/.dsh/sessions/<项目>/<目录名>`）——两者通常相同，
+   * 但 header.id 可能与之不同，所以这里显式换算成 `dirName`。查不到行时原样使用 sessionId
+   * （宁可多匹配一次，也不要因为查不到而漏掉会话）。
+   */
+  const dirNamesOf = useCallback((sessionIds: readonly string[]): string[] => {
+    const all = [...(data?.sessions ?? []), ...(data?.archived ?? [])]
+    const bySessionId = new Map(all.map((r) => [r.sessionId, r]))
+    const out: string[] = []
+    for (const sid of sessionIds) {
+      const name = bySessionId.get(sid)?.dirName ?? sid
+      if (name && !out.includes(name)) out.push(name)
+    }
+    return out
+  }, [data])
+
+  /**
+   * 所选会话若**同属一个工作区**，返回提取器第 3 个参数要的项目目录名；否则返回 null。
+   * 跨工作区（或拿不到 cwd）时不能瞎猜一个——按 id 过滤本身已足够保证只蒸这些会话，
+   * 项目过滤只是提速与护栏，猜错反而会把别的项目拉进来。
+   * 转义规则与 sessions 根下的目录名一致：盘符与路径分隔符换成 `-`，两端加 `--`。
+   */
+  const projectFilterOf = useCallback((dirNames: readonly string[]): string | null => {
+    const all = [...(data?.sessions ?? []), ...(data?.archived ?? [])]
+    const byDirName = new Map(all.map((r) => [r.dirName, r]))
+    const cwds: string[] = []
+    for (const name of dirNames) {
+      const cwd = byDirName.get(name)?.cwd?.trim()
+      if (cwd && !cwds.some((x) => x.toLowerCase() === cwd.toLowerCase())) cwds.push(cwd)
+    }
+    if (cwds.length !== 1) return null
+    return '--' + cwds[0]!.replace(/[:\\/]+/g, '-') + '--'
+  }, [data])
+
+  /**
+   * 把「这些会话」的蒸馏指令复制到剪贴板（失败时把指令原文放进提示里，让用户手动复制）。
+   *
+   * 必须接收具体会话：面板上的「蒸馏后归档 / 蒸馏后删除」是**删除前的安全闸门**，
+   * 闸门保护的正是所选会话。此前它只复制一条"蒸馏近期会话"的固定文案，而归档/删除的对象
+   * 天然是旧会话——"近期"覆盖不到，于是用户以为已蒸过、点继续，那批内容其实从未被蒸馏。
+   */
+  const copyDistill = useCallback(async (sessionIds: readonly string[]): Promise<boolean> => {
+    const dirNames = dirNamesOf(sessionIds)
+    const text = buildDistillTrigger(dirNames, projectFilterOf(dirNames))
     try {
-      await navigator.clipboard.writeText(DISTILL_TRIGGER)
-      showToast('ok', t('distill.copied'))
+      await navigator.clipboard.writeText(text)
+      showToast('ok', t('distill.copied', { count: dirNames.length }))
       return true
     } catch {
-      showToast('err', DISTILL_TRIGGER)
+      showToast('err', text)
       return false
     }
-  }, [showToast, t])
+  }, [dirNamesOf, projectFilterOf, showToast, t])
 
   const [distillGate, setDistillGate] = useState<'archive' | 'delete' | null>(null)
 
@@ -222,13 +280,14 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
         else showToast('warn', t('archive.partial', { count: done, skipped: skipped.length }))
         setSelected(new Set())
         await load()
+        if (done > 0) syncSidebar()
       } catch (error) {
         showToast('err', t('archive.failed', { reason: error instanceof Error ? error.message : String(error) }))
       } finally {
         setBusy(null)
       }
     },
-    [load, showToast, t, updateStats],
+    [load, showToast, syncSidebar, t, updateStats],
   )
 
   const doRestore = useCallback(
@@ -245,13 +304,14 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
         showToast('ok', t('restore.done', { count: done }))
         setArchivedSelected(new Set())
         await load()
+        if (done > 0) syncSidebar()
       } catch (error) {
         showToast('err', error instanceof Error ? error.message : String(error))
       } finally {
         setBusy(null)
       }
     },
-    [load, showToast, t, updateStats],
+    [load, showToast, syncSidebar, t, updateStats],
   )
 
   const doDelete = useCallback(
@@ -267,6 +327,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
         setArchivedSelected(new Set())
         setConfirmDelete(null)
         await load()
+        syncSidebar()
       } catch (error) {
         showToast('err', error instanceof Error ? error.message : String(error))
         setConfirmDelete(null)
@@ -274,7 +335,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
         setBusy(null)
       }
     },
-    [load, showToast, t, updateStats],
+    [load, showToast, syncSidebar, t, updateStats],
   )
 
   const doRunPolicy = useCallback(async () => {
@@ -285,13 +346,14 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
       showToast('ok', t('policy.done', { count: r.archived }))
       setPolicyPreview(null)
       await load()
+      if (r.archived > 0) syncSidebar()
     } catch (error) {
       showToast('err', error instanceof Error ? error.message : String(error))
       setPolicyPreview(null)
     } finally {
       setBusy(null)
     }
-  }, [load, policyPreview, showToast, t])
+  }, [load, policyPreview, showToast, syncSidebar, t])
 
   const stats = data?.stats
 
@@ -403,7 +465,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
             fmtTime={fmtTime}
             busy={busy}
             onArchive={(id) => void doArchive([id])}
-            onDistill={() => void copyDistill()}
+            onDistill={(sessionId) => void copyDistill([sessionId])}
             onOpen={(id) => openSession(id)}
           />
         )}
@@ -418,7 +480,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
             busy={busy}
             onRestore={(id) => void doRestore([id])}
             onDelete={(id) => setConfirmDelete([id])}
-            onDistill={() => void copyDistill()}
+            onDistill={(sessionId) => void copyDistill([sessionId])}
             onOpenRestore={(id) => void doRestore([id]).then(() => openSession(id))}
           />
         )}
@@ -436,7 +498,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
                 type="button"
                 style={S.ghostBtn}
                 disabled={busy !== null}
-                onClick={() => void copyDistill().then((ok) => { if (ok) setDistillGate('archive') })}
+                onClick={() => void copyDistill([...selected]).then((ok) => { if (ok) setDistillGate('archive') })}
               >
                 <IconWand size={15} /> {t('btn.distillThenArchive')}
               </button>
@@ -450,7 +512,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
                 type="button"
                 style={S.ghostBtn}
                 disabled={busy !== null}
-                onClick={() => void copyDistill().then((ok) => { if (ok) setDistillGate('delete') })}
+                onClick={() => void copyDistill([...archivedSelected]).then((ok) => { if (ok) setDistillGate('delete') })}
               >
                 <IconWand size={15} /> {t('btn.distillThenDelete')}
               </button>
@@ -566,7 +628,8 @@ function CurrentList(props: {
   fmtTime: (ts: number) => string
   busy: string | null
   onArchive: (id: string) => void
-  onDistill: () => void
+  /** 传入该行会话的 sessionId：蒸馏指令必须针对具体会话（见 copyDistill 的说明）。 */
+  onDistill: (sessionId: string) => void
   onOpen: (id: string) => void
 }) {
   const { grouped, selected, toggle, setGroupSelected, t, fmtSize, fmtTime, busy, onArchive, onDistill, onOpen } = props
@@ -671,7 +734,7 @@ function CurrentList(props: {
                         <IconArchive size={14} /> {t('btn.archive')}
                       </button>
                     )}
-                    <button type="button" style={S.iconBtn} disabled={busy !== null} title={t('btn.distill')} onClick={onDistill}>
+                    <button type="button" style={S.iconBtn} disabled={busy !== null} title={t('btn.distill')} onClick={() => onDistill(row.sessionId)}>
                       <IconWand size={14} /> {t('btn.distill')}
                     </button>
                   </div>
@@ -719,7 +782,7 @@ function CurrentList(props: {
                                 <IconArchive size={14} /> {t('btn.archive')}
                               </button>
                             )}
-                            <button type="button" style={S.iconBtn} disabled={busy !== null} title={t('btn.distill')} onClick={onDistill}>
+                            <button type="button" style={S.iconBtn} disabled={busy !== null} title={t('btn.distill')} onClick={() => onDistill(child.sessionId)}>
                               <IconWand size={14} /> {t('btn.distill')}
                             </button>
                           </div>
@@ -756,7 +819,8 @@ function ArchivedList(props: {
   busy: string | null
   onRestore: (id: string) => void
   onDelete: (id: string) => void
-  onDistill: () => void
+  /** 传入该行会话的 sessionId：蒸馏指令必须针对具体会话（见 copyDistill 的说明）。 */
+  onDistill: (sessionId: string) => void
   onOpenRestore: (id: string) => void
 }) {
   const { records, selected, toggle, t, fmtSize, fmtTime, busy, onRestore, onDelete, onDistill, onOpenRestore } = props
@@ -822,7 +886,7 @@ function ArchivedList(props: {
           <button type="button" style={S.iconBtn} disabled={busy !== null} onClick={() => onDelete(r.sessionId)}>
             <IconTrash size={14} /> {t('btn.delete')}
           </button>
-          <button type="button" style={S.iconBtn} disabled={busy !== null} title={t('btn.distill')} onClick={onDistill}>
+          <button type="button" style={S.iconBtn} disabled={busy !== null} title={t('btn.distill')} onClick={() => onDistill(r.sessionId)}>
             <IconWand size={14} /> {t('btn.distill')}
           </button>
         </div>
