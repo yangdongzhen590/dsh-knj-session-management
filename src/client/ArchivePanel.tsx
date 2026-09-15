@@ -11,6 +11,7 @@ import { buildDistillTrigger } from './distill.ts'
 import type { PrefillFn } from './index.ts'
 import { IconArchive, IconClose, IconFolder, IconRefresh, IconRestore, IconTrash, IconWand } from './icons.tsx'
 import { syncHostLists } from '../client-sync.ts'
+import { CLIENT_BUILD } from './build-info.ts'
 
 type Tab = 'current' | 'archived'
 type ToastState = { kind: 'ok' | 'warn' | 'err'; text: string } | null
@@ -276,22 +277,24 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
     }
   }, [dirNamesOf, projectFilterOf, showToast, t])
 
-  // 声明位置必须在 gateDistill 之前：该 useCallback 的 finish 闭包引用 setDistillGate，
+  // 声明位置必须在 deliverDistill/gateDistill 之前：闸门的 setDistillGate 调用写在它们里面，
   // 放在后面会触发 TS2448/TS2454（块级变量在声明前使用）。
   const [distillGate, setDistillGate] = useState<DistillGate | null>(null)
 
   /**
-   * 闸门主路径：**优先把指令直接预填进一个新会话**（用户切过去回车即发），
-   * 不可用或失败时**自动退回"仅复制"并如实说明**——绝不静默，否则用户会以为已蒸过。
+   * 把蒸馏指令交到用户手上——**面板上所有蒸馏入口都走这一条**（行内「蒸馏」按钮、
+   * 「蒸馏后归档 / 蒸馏后删除」两个闸门）。优先新建会话预填（用户切过去回车即发），
+   * 不可用或失败时自动退回"仅复制"并如实说明，绝不静默。
    *
    * 只在所选会话同属一个工作区（能确定公共 cwd）时才预填；跨工作区会让新会话落在错的工作区、
    * agent 读错目录，属于静默错误，宁可只复制。
+   *
+   * 返回 `delivered` 供闸门决定确认框正文（预填成功时指令根本没进剪贴板，不能说"已复制"）。
    */
-  const gateDistill = useCallback(async (sessionIds: readonly string[], gate: 'archive' | 'delete'): Promise<void> => {
+  const deliverDistill = useCallback(async (sessionIds: readonly string[]): Promise<{ ok: boolean; delivered: 'prefill' | 'copy' }> => {
     const dirNames = dirNamesOf(sessionIds)
     const cwd = commonCwdOf(dirNames)
     const text = buildDistillTrigger(dirNames, projectFilterOf(dirNames))
-    const finish = (ok: boolean, delivered: 'prefill' | 'copy') => { if (ok) setDistillGate({ action: gate, delivered }) }
 
     /**
      * 退回"仅复制"，并**把原因接在同一句提示里**。
@@ -300,27 +303,31 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
      * 的提示，原文就被覆盖掉——用户既没复制成功、也看不到要复制什么（浏览器实测 failnocopy 场景）。
      * 所以失败路径的提示必须自带指令原文。
      */
-    const copyWithReason = async (reason: string): Promise<void> => {
+    const copyWithReason = async (reason: string): Promise<{ ok: boolean; delivered: 'copy' }> => {
       const copied = await copyDistill(sessionIds)
       if (copied) showToast('warn', `${reason}${t('distill.copiedFallback')}`)
       else showToast('err', `${reason}${t('distill.copyFailedManual')}${text}`)
-      finish(copied, 'copy')
+      return { ok: copied, delivered: 'copy' }
     }
 
     if (!startAgentSession || !cwd) {
-      await copyWithReason(!startAgentSession ? t('distill.noPrefill') : t('distill.multiWorkspace'))
-      return
+      return copyWithReason(!startAgentSession ? t('distill.noPrefill') : t('distill.multiWorkspace'))
     }
 
     const res = await startAgentSession(text, cwd)
     if (res.ok) {
       showToast('ok', res.note ? `${t('distill.prefilled')}（${res.note}）` : t('distill.prefilled'))
-      finish(true, 'prefill')
-      return
+      return { ok: true, delivered: 'prefill' }
     }
     // 预填失败：新会话可能已经建出来了——这一点必须说清楚，否则用户会以为已蒸过
-    await copyWithReason(t('distill.prefillFailedCopied', { reason: res.reason }))
-  }, [commonCwdOf, copyDistill, dirNamesOf, projectFilterOf, setDistillGate, showToast, startAgentSession, t])
+    return copyWithReason(t('distill.prefillFailedCopied', { reason: res.reason }))
+  }, [commonCwdOf, copyDistill, dirNamesOf, projectFilterOf, showToast, startAgentSession, t])
+
+  /** 闸门：先把指令交出去，交付成功才允许用户确认归档/删除。 */
+  const gateDistill = useCallback(async (sessionIds: readonly string[], gate: 'archive' | 'delete'): Promise<void> => {
+    const res = await deliverDistill(sessionIds)
+    if (res.ok) setDistillGate({ action: gate, delivered: res.delivered })
+  }, [deliverDistill, setDistillGate])
 
   const updateStats = useCallback((stats: StatsView) => {
     setData((prev) => (prev === null ? prev : { ...prev, stats }))
@@ -492,6 +499,9 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
 
       <div style={{ padding: '6px 20px 0', color: T.text3, fontSize: 12 }}>
         {t('hint.fts')} · {t('hint.policy', { max: 50 })}
+        {/* 构建标记：客户端 bundle 是页面加载时取的，改了 bundle 必须刷新页面才生效。
+            标出来才能一眼判断"看到的界面到底是哪一版产物"，否则只能靠猜（踩过）。 */}
+        <span title="client bundle 构建时间" style={{ opacity: 0.65 }}> · build {CLIENT_BUILD}</span>
       </div>
 
       <div style={S.tabBar}>
@@ -533,7 +543,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
             fmtTime={fmtTime}
             busy={busy}
             onArchive={(id) => void doArchive([id])}
-            onDistill={(sessionId) => void copyDistill([sessionId])}
+            onDistill={(sessionId) => void deliverDistill([sessionId])}
             onOpen={(id) => openSession(id)}
           />
         )}
@@ -548,7 +558,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
             busy={busy}
             onRestore={(id) => void doRestore([id])}
             onDelete={(id) => setConfirmDelete([id])}
-            onDistill={(sessionId) => void copyDistill([sessionId])}
+            onDistill={(sessionId) => void deliverDistill([sessionId])}
             onOpenRestore={(id) => void doRestore([id]).then(() => openSession(id))}
           />
         )}

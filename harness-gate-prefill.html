@@ -195,7 +195,32 @@
       await waitFor(() => container.querySelectorAll('input[type=checkbox]').length >= 2, '会话行 checkbox')
       if (mode === 'ok') check('列表已按 /list 渲染出 2 个会话', H.fetchCalls.some((u) => u.endsWith('/list')))
 
-      // 3) 全选（两个会话同工作区，闸门应能确定公共 cwd）
+      // 3) 行内「蒸馏」按钮（每行一个，title=蒸馏）：**也必须预填**。
+      //    用户实测报的正是这条：点了只弹"已复制 1 个会话的蒸馏指令"，没有预填到新会话。
+      const rowBtns = [...container.querySelectorAll('button[title="' + t('btn.distill') + '"]')]
+      if (rowBtns.length === 0) throw new Error('没找到行内「蒸馏」按钮')
+      rowBtns[0].click()
+      await wait(400)
+      const rowText = container.innerText
+      if (mode === 'ok') {
+        check('行内「蒸馏」按钮也预填进新会话（不再只复制）',
+          H.created.length === 1 && H.drafts.length === 1 && H.draft.includes('dir-aaa'),
+          JSON.stringify({ created: H.created.length, drafts: H.drafts.length, draft: H.draft.slice(0, 60) }))
+        check('行内蒸馏只点名该行会话（不带上别的会话）', H.draft.includes('dir-aaa') && !H.draft.includes('dir-bbb'))
+        check('行内蒸馏不再出现"已复制 N 个会话"文案', H.copied.length === 0 && !rowText.includes('已复制'), rowText.includes('已复制') ? '仍出现已复制文案' : '')
+        check('行内蒸馏不弹确认框（它后面没有破坏性动作）', !rowText.includes(t('btn.distilledContinue')))
+      } else if (mode === 'fail') {
+        check('行内蒸馏失败 → 退回复制且指令点名该行会话',
+          H.copied.length === 1 && H.copied[0].includes('dir-aaa') && !H.copied[0].includes('dir-bbb'),
+          JSON.stringify(H.copied.map((x) => x.slice(0, 60))))
+      } else {
+        // failnocopy：预填与复制都失败 → 必须把指令原文交出来，且绝不能弹确认框
+        check('行内蒸馏在"复制也失败"时仍把指令原文显示出来', rowText.includes('dir-aaa') && !rowText.includes(t('btn.distilledContinue')))
+      }
+      // 重置计数：下面单独测工具栏闸门
+      H.created.length = 0; H.opened.length = 0; H.drafts.length = 0; H.copied.length = 0; H.draft = ''
+
+      // 4) 全选（两个会话同工作区，闸门应能确定公共 cwd）
       for (const cb of container.querySelectorAll('input[type=checkbox]')) cb.click()
       const gateLabel = t('btn.distillThenArchive')
       const gateBtn = await waitFor(
@@ -203,7 +228,7 @@
         '「蒸馏后归档」闸门按钮',
       )
 
-      // 4) 点闸门
+      // 5) 点闸门
       gateBtn.click()
       await wait(400)
       const text = container.innerText
