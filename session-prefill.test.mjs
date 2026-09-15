@@ -35,8 +35,10 @@ function fakeHost(opts = {}) {
   const state = { getSnapshot: () => ({ draft }) }
   const input = {
     setDraft(text) {
+      // 忠实的假 composer：写入即**覆盖**当前草稿（旧版用例里这个入参被忽略，于是"覆盖用户文字"
+      // 这类缺陷在测试中天然不可见——审查代理正是抓住这一点）。setDraftIgnored = 调用成功但没写进去。
       calls.setDraft.push(text)
-      if (opts.setDraftIgnored) return // 写了但不进 state：模拟"调用成功但没写进去"
+      if (opts.setDraftIgnored) return
       draft = text
     },
     state,
@@ -125,20 +127,39 @@ test('空指令直接失败（不建会话）', async () => {
   assert.equal(h.calls.create, 0, '空指令不该建会话')
 })
 
-test('绝不覆盖用户输入：新会话里已有非空草稿（不含我们的标记）→ 停手', async () => {
+test('新会话里已有用户输入（第一轮就看到）→ **一次都不写**，且返回 ok:false（绝不谎报"已预填"）', async () => {
   const h = fakeHost()
-  // 第一轮之后用户自己敲了字：让 setDraft 变成 no-op，并在第二轮前塞入用户草稿
-  let n = 0
-  const input = {
-    setDraft: () => { n++; if (n === 1) h.setDraftExternally('用户自己敲的内容') },
-    state: { getSnapshot: () => ({ draft: h.getDraft() }) },
-  }
-  const sessions = { create: async () => 's2', open: () => {}, refresh: async () => {}, scope: () => ({}) }
-  const conversation = { input: { for: () => input } }
-  const res = await prefillNewSession({ text: '我们的指令标记xyz', cwd: 'D:/w', sessions, conversation, wait: NOWAIT, maxAttempts: 5 })
-  assert.equal(res.ok, true, JSON.stringify(res))
-  assert.match(res.note ?? '', /已有你的输入/, '应如实说明检测到用户输入并停手')
-  assert.equal(h.getDraft(), '用户自己敲的内容', '绝不能把用户的字覆盖掉')
+  const USER_TEXT = '用户自己敲的内容'
+  h.setDraftExternally(USER_TEXT) // 新会话的 composer 里已经有用户的字
+  const res = await prefillNewSession({
+    text: '我们的指令标记xyz', cwd: 'D:/w', sessions: h.sessions, conversation: h.conversation, wait: NOWAIT, maxAttempts: 5,
+  })
+  assert.equal(res.ok, false, '没有真的把指令交付出去就不能报 ok:true——闸门会据此说"已预填"并放行删除')
+  assert.match(res.reason, /未覆盖/)
+  assert.equal(h.getDraft(), USER_TEXT, '绝不能把用户的字覆盖掉')
+  assert.equal(h.calls.setDraft.length, 0, '预读发现有人的字时，setDraft 一次都不该被调用')
+})
+
+test('重试窗口里用户开始打字（前两轮还拿不到输入面）→ 写之前发现即停手', async () => {
+  const h = fakeHost({ scopeReadyAt: 2, inputReadyAt: 2 })
+  const USER_TEXT = '我正在打字'
+  h.setDraftExternally(USER_TEXT) // 第 0/1 轮取不到输入面，用户就在这个窗口里敲了字
+  const res = await prefillNewSession({
+    text: '我们的指令标记xyz', cwd: 'D:/w', sessions: h.sessions, conversation: h.conversation, wait: NOWAIT, maxAttempts: 5,
+  })
+  assert.equal(res.ok, false, JSON.stringify(res))
+  assert.equal(h.getDraft(), USER_TEXT, '不得覆盖')
+  assert.equal(h.calls.setDraft.length, 0, '一旦看到非空且不含标记的草稿就不该再写')
+})
+
+test('onWarn 自己抛错也不能把 prefillNewSession 带崩（约束 1：绝不抛）', async () => {
+  const h = fakeHost({ createThrows: true })
+  const res = await prefillNewSession({
+    text: '指令', cwd: 'D:/w', sessions: h.sessions, conversation: h.conversation, wait: NOWAIT,
+    onWarn: () => { throw new Error('诊断口炸了') },
+  })
+  assert.equal(res.ok, false)
+  assert.match(res.reason, /抛错/)
 })
 
 test('工作区按路径匹配：命中返回 id，未命中/异常返回 undefined（不新建工作区）', () => {

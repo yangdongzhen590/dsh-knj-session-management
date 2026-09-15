@@ -48,7 +48,7 @@
 
   const Q = new URLSearchParams(location.search)
   SHARED.bundle = Q.get('bundle') || 'client/client.js'
-  SHARED.modes = (Q.get('modes') || 'ok,fail,failnocopy').split(',').filter(Boolean)
+  SHARED.modes = (Q.get('modes') || 'ok,fail,failnocopy,usertyped,nocwd').split(',').filter(Boolean)
 </script>
 <script>
 (async function main() {
@@ -99,6 +99,9 @@
   /** 跑一种模式：全新桩 + 全新 React 根，返回该模式的结论行。 */
   async function runScenario(mode) {
     const H = { mode, fetchCalls: [], created: [], opened: [], drafts: [], copied: [], draft: '' }
+    // usertyped：模拟"新会话的输入框里已经有用户自己敲的字"——预填必须**一次都不写**，
+    // 而且绝不能把这次"没交付"报成"已预填"（否则用户会以为蒸过了，随后确认删除）。
+    if (mode === 'usertyped') H.draft = '用户自己敲的内容'
     const checks = []
     const check = (name, ok, detail) => checks.push({ name, ok: !!ok, detail: detail === undefined ? '' : String(detail) })
 
@@ -115,8 +118,8 @@
       refresh: async () => {},
       create: async (opts) => {
         H.created.push(opts)
-        // fail / failnocopy 都模拟"新会话建不出来"
-        if (mode !== 'ok') throw new Error('boom: create 失败')
+        // fail / failnocopy 模拟"新会话建不出来"；usertyped 模拟"会话建出来了但输入框里已有用户的字"
+        if (mode === 'fail' || mode === 'failnocopy') throw new Error('boom: create 失败')
         return 'new-sess-1'
       },
       scope: (id) => (id === 'new-sess-1' ? { sessionId: id } : undefined),
@@ -148,7 +151,13 @@
     window.fetch = async (url) => {
       const u = String(url)
       H.fetchCalls.push(u)
-      if (u.endsWith('/list')) return { ok: true, status: 200, json: async () => LIST }
+      // nocwd：第二行没有 cwd 记录（宿主 header 里 cwd 是可选字段，真实存在这种行）。
+      // "一个有 cwd + 一个没有"曾会被误判成"同属一个工作区"并把新会话建到猜出来的目录。
+      const sessions = mode === 'nocwd'
+        ? [ROWS[0], Object.assign({}, ROWS[1], { cwd: undefined, group: 'no-cwd' })]
+        : ROWS
+      const list = Object.assign({}, LIST, { sessions })
+      if (u.endsWith('/list')) return { ok: true, status: 200, json: async () => list }
       return { ok: true, status: 200, json: async () => ({ archived: 0, restored: 0, deleted: 0, skipped: 0, skippedReasons: [], stats: STATS }) }
     }
 
@@ -202,7 +211,7 @@
       rowBtns[0].click()
       await wait(400)
       const rowText = container.innerText
-      if (mode === 'ok') {
+      if (mode === 'ok' || mode === 'nocwd') {
         check('行内「蒸馏」按钮也预填进新会话（不再只复制）',
           H.created.length === 1 && H.drafts.length === 1 && H.draft.includes('dir-aaa'),
           JSON.stringify({ created: H.created.length, drafts: H.drafts.length, draft: H.draft.slice(0, 60) }))
@@ -213,12 +222,18 @@
         check('行内蒸馏失败 → 退回复制且指令点名该行会话',
           H.copied.length === 1 && H.copied[0].includes('dir-aaa') && !H.copied[0].includes('dir-bbb'),
           JSON.stringify(H.copied.map((x) => x.slice(0, 60))))
+      } else if (mode === 'usertyped') {
+        check('用户已打字：绝不覆盖（草稿仍是用户那句话）', H.draft === '用户自己敲的内容', JSON.stringify(H.draft))
+        check('用户已打字：不谎报预填成功，退回复制指令', H.copied.length === 1 && H.copied[0].includes('dir-aaa'),
+          JSON.stringify({ copied: H.copied.length, created: H.created.length }))
+        check('用户已打字：提示如实说明原因（未覆盖）', rowText.includes('未覆盖') || rowText.includes('已有你写的内容'))
       } else {
         // failnocopy：预填与复制都失败 → 必须把指令原文交出来，且绝不能弹确认框
         check('行内蒸馏在"复制也失败"时仍把指令原文显示出来', rowText.includes('dir-aaa') && !rowText.includes(t('btn.distilledContinue')))
       }
-      // 重置计数：下面单独测工具栏闸门
-      H.created.length = 0; H.opened.length = 0; H.drafts.length = 0; H.copied.length = 0; H.draft = ''
+      // 重置计数：下面单独测工具栏闸门（usertyped 下不能清掉草稿，那正是"用户的字"）
+      H.created.length = 0; H.opened.length = 0; H.drafts.length = 0; H.copied.length = 0
+      if (mode !== 'usertyped') H.draft = ''
 
       // 4) 全选（两个会话同工作区，闸门应能确定公共 cwd）
       for (const cb of container.querySelectorAll('input[type=checkbox]')) cb.click()
@@ -249,6 +264,14 @@
         check('退回复制，且复制的是所选会话的指令', H.copied.length === 1 && H.copied[0].includes('dir-aaa') && H.copied[0].includes('dir-bbb'), JSON.stringify(H.copied.map((x) => x.slice(0, 60))))
         check('提示如实带上失败原因（boom）', text.includes('boom'))
         check('确认框正文回落到"已复制"版本', dialogShown && text.includes('蒸馏指令已复制'))
+      } else if (mode === 'usertyped') {
+        check('用户已打字：闸门也不预填（草稿仍未被覆盖）', H.draft === '用户自己敲的内容', JSON.stringify(H.draft))
+        check('用户已打字：闸门不谎报预填，确认框正文是"已复制"版本', dialogShown && text.includes('蒸馏指令已复制') && !text.includes('预填到新建的会话'))
+        check('用户已打字：确认框弹出说明指令确实交付过（在剪贴板里）', H.copied.length === 1)
+      } else if (mode === 'nocwd') {
+        check('选中项里有一行没有 cwd → 不预填（不猜目录）', H.created.length === 0, JSON.stringify(H.created))
+        check('退回复制且指令带走两行会话', H.copied.length === 1 && H.copied[0].includes('dir-aaa') && H.copied[0].includes('dir-bbb'))
+        check('提示如实说"没有记录 cwd"，不推给"多个工作区"', text.includes('没有记录 cwd') && !text.includes('来自多个工作区'))
       } else {
         check('预填失败且复制失败 → 不出现确认框（绝不放行未蒸馏的删除）', !dialogShown)
         check('失败时提示里仍带指令原文供手工复制', text.includes('dir-aaa') && text.includes('dir-bbb'))

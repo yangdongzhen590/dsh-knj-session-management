@@ -3,7 +3,7 @@
  * session list, batch archive/restore/delete with confirmations, and the
  * auto-policy runner. Styled with the host's --dsw-alias design tokens.
  */
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { Dict } from './locales.ts'
 import * as api from './api.ts'
 import type { ArchiveRecordView, SessionRowView, SessionListResponse, StatsView, WorkspaceGroupView } from './api.ts'
@@ -236,26 +236,42 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
     const cwds: string[] = []
     for (const name of dirNames) {
       const cwd = byDirName.get(name)?.cwd?.trim()
-      if (cwd && !cwds.some((x) => x.toLowerCase() === cwd.toLowerCase())) cwds.push(cwd)
+      // 任一行没有 cwd 就不能给项目过滤：过滤参数写错会把用户选中的别的项目的会话漏掉。
+      if (!cwd) return null
+      if (!cwds.some((x) => x.toLowerCase() === cwd.toLowerCase())) cwds.push(cwd)
     }
     if (cwds.length !== 1) return null
     return '--' + cwds[0]!.replace(/[:\\/]+/g, '-') + '--'
   }, [data])
 
   /**
-   * 所选会话若**同属一个工作区**，返回它们共同的 cwd；否则返回 null（不能瞎猜）。
-   * 新会话要落在这个目录：agent 的 cwd 与被归档/删除那批会话一致，蒸馏出来的东西才对得上。
+   * 所选会话的预填落点判定。
+   *
+   * **必须全部行都有 cwd 且完全相同**，否则返回原因：只看"能拿到的那些 cwd 是否一致"是错的——
+   * "一个有 cwd + 一个没有"也会凑出唯一值，于是把新会话建到猜出来的目录里（静默错误）。
+   * 另外死工作区（目录已被删除）也不能作为落点：宿主建会话时会 `mkdir -p`，会把用户已经删掉的
+   * 项目目录重新建出来，属于计划外副作用——这时宁可只复制指令。
    */
-  const commonCwdOf = useCallback((dirNames: readonly string[]): string | null => {
+  const cwdTargetOf = useCallback((dirNames: readonly string[]): { cwd: string | null; why: 'ok' | 'none' | 'mixed' | 'dead' } => {
     const all = [...(data?.sessions ?? []), ...(data?.archived ?? [])]
     const byDirName = new Map(all.map((r) => [r.dirName, r]))
+    const deadKeys = new Set((data?.workspaces ?? []).filter((w) => w.dead).map((w) => w.key))
     const cwds: string[] = []
+    let sawDead = false
     for (const name of dirNames) {
-      const cwd = byDirName.get(name)?.cwd?.trim()
-      if (cwd && !cwds.some((x) => x.toLowerCase() === cwd.toLowerCase())) cwds.push(cwd)
+      const row = byDirName.get(name)
+      if (row && deadKeys.has(row.workspaceKey)) sawDead = true
+      const cwd = row?.cwd?.trim()
+      if (!cwd) return { cwd: null, why: 'none' }
+      if (!cwds.some((x) => x.toLowerCase() === cwd.toLowerCase())) cwds.push(cwd)
     }
-    return cwds.length === 1 ? cwds[0]! : null
+    if (sawDead) return { cwd: null, why: 'dead' }
+    if (cwds.length !== 1) return { cwd: null, why: 'mixed' }
+    return { cwd: cwds[0]!, why: 'ok' }
   }, [data])
+
+  /** 只要落点、不要原因时的便捷包装（也供测试/其他调用点使用）。 */
+  const commonCwdOf = useCallback((dirNames: readonly string[]): string | null => cwdTargetOf(dirNames).cwd, [cwdTargetOf])
 
   /**
    * 把「这些会话」的蒸馏指令复制到剪贴板（失败时把指令原文放进提示里，让用户手动复制）。
@@ -280,6 +296,8 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
   // 声明位置必须在 deliverDistill/gateDistill 之前：闸门的 setDistillGate 调用写在它们里面，
   // 放在后面会触发 TS2448/TS2454（块级变量在声明前使用）。
   const [distillGate, setDistillGate] = useState<DistillGate | null>(null)
+  /** 预填在飞标记（同步）：挡住同一 tick 的重复点击（busy 的 state 更新要等下一次渲染才生效）。 */
+  const distillInFlight = useRef(false)
 
   /**
    * 把蒸馏指令交到用户手上——**面板上所有蒸馏入口都走这一条**（行内「蒸馏」按钮、
@@ -292,36 +310,51 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
    * 返回 `delivered` 供闸门决定确认框正文（预填成功时指令根本没进剪贴板，不能说"已复制"）。
    */
   const deliverDistill = useCallback(async (sessionIds: readonly string[]): Promise<{ ok: boolean; delivered: 'prefill' | 'copy' }> => {
-    const dirNames = dirNamesOf(sessionIds)
-    const cwd = commonCwdOf(dirNames)
-    const text = buildDistillTrigger(dirNames, projectFilterOf(dirNames))
+    // 连点守卫：预填要建会话（有副作用，且最长 ~6s 才收尾），不像"只复制"那样点点无害。
+    // 同步 ref 挡同一 tick 的重复点击，busy 负责把按钮置灰（state 更新要等下一次渲染）。
+    if (distillInFlight.current) return { ok: false, delivered: 'copy' }
+    distillInFlight.current = true
+    setBusy('distill')
+    try {
+      const dirNames = dirNamesOf(sessionIds)
+      const target = cwdTargetOf(dirNames)
+      const text = buildDistillTrigger(dirNames, projectFilterOf(dirNames))
 
-    /**
-     * 退回"仅复制"，并**把原因接在同一句提示里**。
-     *
-     * toast 只有一个槽位：`copyDistill` 复制失败时会把指令原文弹出来，如果紧接着再弹一句"只有原因"
-     * 的提示，原文就被覆盖掉——用户既没复制成功、也看不到要复制什么（浏览器实测 failnocopy 场景）。
-     * 所以失败路径的提示必须自带指令原文。
-     */
-    const copyWithReason = async (reason: string): Promise<{ ok: boolean; delivered: 'copy' }> => {
-      const copied = await copyDistill(sessionIds)
-      if (copied) showToast('warn', `${reason}${t('distill.copiedFallback')}`)
-      else showToast('err', `${reason}${t('distill.copyFailedManual')}${text}`)
-      return { ok: copied, delivered: 'copy' }
-    }
+      /**
+       * 退回"仅复制"，并**把原因接在同一句提示里**。
+       *
+       * toast 只有一个槽位：`copyDistill` 复制失败时会把指令原文弹出来，如果紧接着再弹一句"只有原因"
+       * 的提示，原文就被覆盖掉——用户既没复制成功、也看不到要复制什么（浏览器实测 failnocopy 场景）。
+       * 所以失败路径的提示必须自带指令原文。
+       */
+      const copyWithReason = async (reason: string): Promise<{ ok: boolean; delivered: 'copy' }> => {
+        const copied = await copyDistill(sessionIds)
+        if (copied) showToast('warn', `${reason}${t('distill.copiedFallback')}`)
+        else showToast('err', `${reason}${t('distill.copyFailedManual')}${text}`)
+        return { ok: copied, delivered: 'copy' }
+      }
 
-    if (!startAgentSession || !cwd) {
-      return copyWithReason(!startAgentSession ? t('distill.noPrefill') : t('distill.multiWorkspace'))
-    }
+      if (!startAgentSession) return await copyWithReason(t('distill.noPrefill'))
+      if (!target.cwd) {
+        // 三种"落点不确定"要分清楚，否则文案不实（全是多工作区就说不通"整组都没有 cwd"）
+        const why = target.why === 'dead'
+          ? t('distill.deadWorkspace')
+          : target.why === 'none' ? t('distill.noCwd') : t('distill.multiWorkspace')
+        return await copyWithReason(why)
+      }
 
-    const res = await startAgentSession(text, cwd)
-    if (res.ok) {
-      showToast('ok', res.note ? `${t('distill.prefilled')}（${res.note}）` : t('distill.prefilled'))
-      return { ok: true, delivered: 'prefill' }
+      const res = await startAgentSession(text, target.cwd)
+      if (res.ok) {
+        showToast('ok', res.note ? `${t('distill.prefilled')}（${res.note}）` : t('distill.prefilled'))
+        return { ok: true, delivered: 'prefill' }
+      }
+      // 预填失败：新会话可能已经建出来了——这一点必须说清楚，否则用户会以为已蒸过
+      return await copyWithReason(t('distill.prefillFailedCopied', { reason: res.reason }))
+    } finally {
+      distillInFlight.current = false
+      setBusy(null)
     }
-    // 预填失败：新会话可能已经建出来了——这一点必须说清楚，否则用户会以为已蒸过
-    return copyWithReason(t('distill.prefillFailedCopied', { reason: res.reason }))
-  }, [commonCwdOf, copyDistill, dirNamesOf, projectFilterOf, showToast, startAgentSession, t])
+  }, [copyDistill, cwdTargetOf, dirNamesOf, projectFilterOf, setBusy, showToast, startAgentSession, t])
 
   /** 闸门：先把指令交出去，交付成功才允许用户确认归档/删除。 */
   const gateDistill = useCallback(async (sessionIds: readonly string[], gate: 'archive' | 'delete'): Promise<void> => {
@@ -528,6 +561,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
           {busy === 'archive' && t('archive.progress', { done: 0, total: 0 })}
           {busy === 'restore' && t('restore.done', { count: 0 })}
           {busy === 'policy' && t('policy.progress', { done: 0, total: 0 })}
+          {busy === 'distill' && t('distill.working')}
         </div>
       )}
 

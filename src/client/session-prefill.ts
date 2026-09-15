@@ -92,7 +92,8 @@ export async function prefillNewSession(opts: PrefillOptions): Promise<PrefillRe
   const wait = opts.wait ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
   const maxAttempts = opts.maxAttempts ?? DEFAULT_ATTEMPTS
   const fail = (reason: string): PrefillResult => {
-    opts.onWarn?.('[knj-sm] prefill failed', { reason })
+    // onWarn 是调用方给的诊断口：它自己抛错不能把本函数带崩（约束 1「绝不抛」）。
+    try { opts.onWarn?.('[knj-sm] prefill failed', { reason }) } catch { /* 诊断失败不影响结果 */ }
     return { ok: false, reason }
   }
 
@@ -115,14 +116,23 @@ export async function prefillNewSession(opts: PrefillOptions): Promise<PrefillRe
     try { sessions.open?.(newId) } catch (e) { return fail(`sessions.open 抛错：${String(e)}`) }
     try { await sessions.refresh?.() } catch { /* 列表刷新失败不影响预填 */ }
 
-    // 新会话的 composer 懒挂载：轮询 + 写入后读回校验
+    // 新会话的 composer 懒挂载：轮询 → **写之前先读**（确认没人在打字）→ 写 → 读回校验。
     const marker = text.slice(0, 12)
+    /** 读当前草稿；读不到（state 缺失或还没物化）返回 ''。 */
+    const readDraft = (input: PrefillInputFace): string => {
+      try { return input.state?.getSnapshot?.()?.draft ?? '' } catch { return '' }
+    }
+    /** 读回命中我们的标记即视为已交付（也涵盖上一轮写入延迟生效的情况）。 */
+    const delivered = (): PrefillResult => (workspaceId
+      ? { ok: true, sessionId: newId }
+      : { ok: true, sessionId: newId, note: `未能把 ${opts.cwd ?? '(未知目录)'} 匹配成工作区，已按 cwd 建会话，请确认左侧工作区` })
+
     let lastErr = ''
     for (let i = 0; i < maxAttempts; i++) {
       let actx: unknown
       try { actx = sessions.scope(newId) } catch (e) { lastErr = `sessions.scope 抛错：${String(e)}` }
       if (actx === undefined || actx === null) {
-        lastErr = lastErr || `sessions.scope("${newId}") 尚未就绪`
+        lastErr = `sessions.scope("${newId}") 尚未就绪`
         await wait(POLL_MS)
         continue
       }
@@ -130,33 +140,28 @@ export async function prefillNewSession(opts: PrefillOptions): Promise<PrefillRe
         try { return opts.conversation?.input?.for?.(actx) } catch (e) { lastErr = `conversation.input.for 抛错：${String(e)}`; return undefined }
       })()
       if (!input) {
-        lastErr = lastErr || 'conversation.input.for(scope) 尚未就绪'
+        lastErr = 'conversation.input.for(scope) 尚未就绪'
         await wait(POLL_MS)
         continue
       }
       const setDraft = typeof input.setDraft === 'function' ? input.setDraft : input.actions?.setDraft
       if (typeof setDraft !== 'function') {
-        lastErr = lastErr || '输入面没有 setDraft'
+        lastErr = '输入面没有 setDraft'
         await wait(POLL_MS)
         continue
       }
-      // 规范顺序：先物化输入态（getSnapshot），再写 draft
+      // ① **先读后写**。草稿非空且不含我们的标记 = 有人在打字 → 一次都不写。
+      //    顺序不能反：先写再校验的话，覆盖已经发生，读回只能证明"我们写进去了"，用户的字已经丢了。
       try { input.state?.getSnapshot?.() } catch (e) { lastErr = `input.state.getSnapshot 抛错：${String(e)}` }
+      const before = readDraft(input)
+      if (before.includes(marker)) return delivered()
+      if (before.trim() !== '') return fail('新会话的输入框里已有你写的内容，未覆盖')
+
+      // ② 再写，并读回校验（setDraft 调用成功 ≠ 草稿真的写进去了）。
       try { setDraft.call(input, text) } catch (e) { lastErr = `setDraft 抛错：${String(e)}` }
-      try {
-        const draft = input.state?.getSnapshot?.()?.draft ?? ''
-        if (draft.includes(marker)) {
-          return workspaceId ? { ok: true, sessionId: newId } : { ok: true, sessionId: newId, note: `未能把 ${opts.cwd ?? '(未知目录)'} 匹配成工作区，已按 cwd 建会话，请确认左侧工作区` }
-        }
-        // 用户已经开始在这个新会话里输入（草稿非空且不含我们的标记）→ 立即停手，不覆盖他刚敲的字。
-        // 仅从第二轮起判定：第一轮刚写完，非空但无标记更可能是写入未生效，应继续重试而不是误判。
-        if (i > 0 && draft.trim() !== '') {
-          return { ok: true, sessionId: newId, note: '检测到新会话里已有你的输入，已停止自动预填（指令仍需手动发送）' }
-        }
-        lastErr = lastErr || `setDraft 后未读到草稿（draft="${draft.slice(0, 40)}"）`
-      } catch (e) {
-        lastErr = `读回校验抛错：${String(e)}`
-      }
+      const after = readDraft(input)
+      if (after.includes(marker)) return delivered()
+      lastErr = `setDraft 后未读到草稿（draft="${after.slice(0, 40)}"）`
       await wait(POLL_MS)
     }
     return fail(`重试 ${maxAttempts} 次后仍未确认预填成功（新会话 ${newId} 已创建；最后一次错误：${lastErr || '未知'}）`)
