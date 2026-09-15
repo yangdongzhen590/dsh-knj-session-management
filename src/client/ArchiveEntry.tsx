@@ -4,7 +4,7 @@
  */
 import { useState } from 'react'
 import type { Dict } from './locales.ts'
-import type { SessionsService, WorkspacesService } from './index.ts'
+import type { SessionsService, WorkspacesService, PrefillFn } from './index.ts'
 import { ArchivePanel } from './ArchivePanel.tsx'
 import { IconArchive } from './icons.tsx'
 
@@ -12,9 +12,11 @@ export interface ArchiveEntryProps {
   t: (key: keyof Dict, vars?: Record<string, string | number>) => string
   sessions?: SessionsService
   workspaces?: WorkspacesService
+  /** 新建会话并预填指令（与知识库插件的 wiki-distill 入口同路径）；缺省时面板自动退回"仅复制"。 */
+  startAgentSession?: PrefillFn
 }
 
-export function ArchiveEntry({ t, sessions, workspaces }: ArchiveEntryProps) {
+export function ArchiveEntry({ t, sessions, workspaces, startAgentSession }: ArchiveEntryProps) {
   const [open, setOpen] = useState(false)
   return (
     <>
@@ -50,7 +52,7 @@ export function ArchiveEntry({ t, sessions, workspaces }: ArchiveEntryProps) {
         </span>
         <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', flex: 1, textAlign: 'left' }}>{t('entry.label')}</span>
       </button>
-      {open && <ArchivePanel onClose={() => setOpen(false)} t={t} sessions={sessions} workspaces={workspaces} />}
+      {open && <ArchivePanel onClose={() => setOpen(false)} t={t} sessions={sessions} workspaces={workspaces} startAgentSession={startAgentSession} />}
     </>
   )
 }
