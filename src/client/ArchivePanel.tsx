@@ -8,17 +8,26 @@ import type { Dict } from './locales.ts'
 import * as api from './api.ts'
 import type { ArchiveRecordView, SessionRowView, SessionListResponse, StatsView, WorkspaceGroupView } from './api.ts'
 import { buildDistillTrigger } from './distill.ts'
+import type { PrefillFn } from './index.ts'
 import { IconArchive, IconClose, IconFolder, IconRefresh, IconRestore, IconTrash, IconWand } from './icons.tsx'
 import { syncHostLists } from '../client-sync.ts'
 
 type Tab = 'current' | 'archived'
 type ToastState = { kind: 'ok' | 'warn' | 'err'; text: string } | null
+/**
+ * 闸门状态：待确认的动作 + 指令是**怎么交到用户手上**的。
+ * `delivered` 必须一路带到确认框：预填成功时指令根本没进剪贴板，确认正文若照抄"已复制"
+ * 就是在骗人（用户会去粘贴一个空的剪贴板）。
+ */
+type DistillGate = { action: 'archive' | 'delete'; delivered: 'prefill' | 'copy' }
 
 export interface ArchivePanelProps {
   onClose: () => void
   t: (key: keyof Dict, vars?: Record<string, string | number>) => string
   sessions?: SessionsService
   workspaces?: WorkspacesService
+  /** 新建会话并预填蒸馏指令（与知识库插件的 wiki-distill 入口同路径）。缺省时闸门退回"仅复制"。 */
+  startAgentSession?: PrefillFn
 }
 
 /** The subset of the host `sessions` client service this plugin touches. */
@@ -143,7 +152,7 @@ const S: Record<string, React.CSSProperties> = {
   hint: { color: T.text3, fontSize: 12, marginTop: 6 },
 }
 
-export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelProps) {
+export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSession }: ArchivePanelProps) {
   const [tab, setTab] = useState<Tab>('current')
   const [data, setData] = useState<SessionListResponse | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -233,6 +242,21 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
   }, [data])
 
   /**
+   * 所选会话若**同属一个工作区**，返回它们共同的 cwd；否则返回 null（不能瞎猜）。
+   * 新会话要落在这个目录：agent 的 cwd 与被归档/删除那批会话一致，蒸馏出来的东西才对得上。
+   */
+  const commonCwdOf = useCallback((dirNames: readonly string[]): string | null => {
+    const all = [...(data?.sessions ?? []), ...(data?.archived ?? [])]
+    const byDirName = new Map(all.map((r) => [r.dirName, r]))
+    const cwds: string[] = []
+    for (const name of dirNames) {
+      const cwd = byDirName.get(name)?.cwd?.trim()
+      if (cwd && !cwds.some((x) => x.toLowerCase() === cwd.toLowerCase())) cwds.push(cwd)
+    }
+    return cwds.length === 1 ? cwds[0]! : null
+  }, [data])
+
+  /**
    * 把「这些会话」的蒸馏指令复制到剪贴板（失败时把指令原文放进提示里，让用户手动复制）。
    *
    * 必须接收具体会话：面板上的「蒸馏后归档 / 蒸馏后删除」是**删除前的安全闸门**，
@@ -252,7 +276,51 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
     }
   }, [dirNamesOf, projectFilterOf, showToast, t])
 
-  const [distillGate, setDistillGate] = useState<'archive' | 'delete' | null>(null)
+  // 声明位置必须在 gateDistill 之前：该 useCallback 的 finish 闭包引用 setDistillGate，
+  // 放在后面会触发 TS2448/TS2454（块级变量在声明前使用）。
+  const [distillGate, setDistillGate] = useState<DistillGate | null>(null)
+
+  /**
+   * 闸门主路径：**优先把指令直接预填进一个新会话**（用户切过去回车即发），
+   * 不可用或失败时**自动退回"仅复制"并如实说明**——绝不静默，否则用户会以为已蒸过。
+   *
+   * 只在所选会话同属一个工作区（能确定公共 cwd）时才预填；跨工作区会让新会话落在错的工作区、
+   * agent 读错目录，属于静默错误，宁可只复制。
+   */
+  const gateDistill = useCallback(async (sessionIds: readonly string[], gate: 'archive' | 'delete'): Promise<void> => {
+    const dirNames = dirNamesOf(sessionIds)
+    const cwd = commonCwdOf(dirNames)
+    const text = buildDistillTrigger(dirNames, projectFilterOf(dirNames))
+    const finish = (ok: boolean, delivered: 'prefill' | 'copy') => { if (ok) setDistillGate({ action: gate, delivered }) }
+
+    /**
+     * 退回"仅复制"，并**把原因接在同一句提示里**。
+     *
+     * toast 只有一个槽位：`copyDistill` 复制失败时会把指令原文弹出来，如果紧接着再弹一句"只有原因"
+     * 的提示，原文就被覆盖掉——用户既没复制成功、也看不到要复制什么（浏览器实测 failnocopy 场景）。
+     * 所以失败路径的提示必须自带指令原文。
+     */
+    const copyWithReason = async (reason: string): Promise<void> => {
+      const copied = await copyDistill(sessionIds)
+      if (copied) showToast('warn', `${reason}${t('distill.copiedFallback')}`)
+      else showToast('err', `${reason}${t('distill.copyFailedManual')}${text}`)
+      finish(copied, 'copy')
+    }
+
+    if (!startAgentSession || !cwd) {
+      await copyWithReason(!startAgentSession ? t('distill.noPrefill') : t('distill.multiWorkspace'))
+      return
+    }
+
+    const res = await startAgentSession(text, cwd)
+    if (res.ok) {
+      showToast('ok', res.note ? `${t('distill.prefilled')}（${res.note}）` : t('distill.prefilled'))
+      finish(true, 'prefill')
+      return
+    }
+    // 预填失败：新会话可能已经建出来了——这一点必须说清楚，否则用户会以为已蒸过
+    await copyWithReason(t('distill.prefillFailedCopied', { reason: res.reason }))
+  }, [commonCwdOf, copyDistill, dirNamesOf, projectFilterOf, setDistillGate, showToast, startAgentSession, t])
 
   const updateStats = useCallback((stats: StatsView) => {
     setData((prev) => (prev === null ? prev : { ...prev, stats }))
@@ -498,7 +566,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
                 type="button"
                 style={S.ghostBtn}
                 disabled={busy !== null}
-                onClick={() => void copyDistill([...selected]).then((ok) => { if (ok) setDistillGate('archive') })}
+                onClick={() => void gateDistill([...selected], 'archive')}
               >
                 <IconWand size={15} /> {t('btn.distillThenArchive')}
               </button>
@@ -512,7 +580,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
                 type="button"
                 style={S.ghostBtn}
                 disabled={busy !== null}
-                onClick={() => void copyDistill([...archivedSelected]).then((ok) => { if (ok) setDistillGate('delete') })}
+                onClick={() => void gateDistill([...archivedSelected], 'delete')}
               >
                 <IconWand size={15} /> {t('btn.distillThenDelete')}
               </button>
@@ -530,12 +598,14 @@ export function ArchivePanel({ onClose, t, sessions, workspaces }: ArchivePanelP
       {distillGate !== null && (
         <ConfirmDialog
           title={t('btn.distill')}
-          body={t('distill.confirmBody', { action: distillGate === 'archive' ? t('distill.action.archive') : t('distill.action.delete') })}
+          body={t(distillGate.delivered === 'prefill' ? 'distill.confirmBodyPrefilled' : 'distill.confirmBody', {
+            action: distillGate.action === 'archive' ? t('distill.action.archive') : t('distill.action.delete'),
+          })}
           cancelText={t('btn.cancel')}
           confirmText={t('btn.distilledContinue')}
           onCancel={() => setDistillGate(null)}
           onConfirm={() => {
-            const gate = distillGate
+            const gate = distillGate.action
             setDistillGate(null)
             if (gate === 'archive') void doArchive([...(tab === 'current' ? selected : [])])
             else setConfirmDelete([...(tab === 'archived' ? archivedSelected : [])])

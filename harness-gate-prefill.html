@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh">
+<head>
+  <meta charset="utf-8">
+  <title>dsh-knj-session-management · 闸门/预填 harness</title>
+  <style>
+    body { font: 13px/1.5 ui-monospace, Consolas, monospace; margin: 0; padding: 12px; }
+    .stage { border: 1px dashed #888; padding: 8px; margin-bottom: 12px; }
+    #result { white-space: pre-wrap; background: #111; color: #ddd; padding: 12px; }
+  </style>
+</head>
+<body>
+<!--
+  仅开发用的手工 harness（不在 package.json 的 files 里，不会发布）。
+
+  为什么需要它：client/client.js 是 window.__ModuleLoader__ 闭包产物，node --test 无法 import；
+  而「蒸馏后归档/删除」这套改动全部是客户端接线（点击 → 新建会话预填 → 确认框），只有真实 DOM +
+  真实 React 事件才能验证。这里把宿主 client 服务（sessions/conversation/workspaces/locale/slots）
+  与 fetch 全部桩化，在无头浏览器里真的把闸门按钮点一遍。
+
+  用法：
+    harness-gate-prefill.html                        # 依次跑 ok / fail / failnocopy
+    harness-gate-prefill.html?modes=ok               # 只跑一种
+    harness-gate-prefill.html?bundle=_verify-installed/client.js   # 验证安装副本的字节
+
+  三种模式：
+    ok         预填成功 → 新会话草稿里必须出现所选会话的 dirName；确认框正文必须说"已预填"（不是"已复制"）
+    fail       create 抛错 → 退回复制，提示必须如实带上失败原因
+    failnocopy create 抛错 + 剪贴板也失败 → 绝不能出现确认框（否则等于放行未蒸馏的删除），
+               且提示里必须带指令原文（toast 只有一个槽位，容易被后一句覆盖）
+-->
+<div id="stages"></div>
+<pre id="result">running…</pre>
+
+<script src="node_modules/react/umd/react.development.js"></script>
+<script src="node_modules/react-dom/umd/react-dom.development.js"></script>
+<script>
+  const SHARED = { errors: [], mod: null }
+  // React dev 构建会对 `[<IconWand/>, text]` 这类多子节点 JSX 报 key 警告——这是插件既有写法
+  // （icons/entry 一直如此），与闸门改动无关。分开计数，避免把既有噪音算成回归。
+  const KEY_WARNING = 'unique "key" prop'
+  window.__SHARED__ = SHARED
+  window.addEventListener('error', (e) => SHARED.errors.push('window.error: ' + (e.message || String(e))))
+  window.addEventListener('unhandledrejection', (e) => SHARED.errors.push('unhandledrejection: ' + String(e.reason)))
+  const _err = console.error
+  console.error = (...a) => { SHARED.errors.push('console.error: ' + a.map(String).join(' ')); _err(...a) }
+  window.__ModuleLoader__ = { load: (m) => { SHARED.mod = m } }
+
+  const Q = new URLSearchParams(location.search)
+  SHARED.bundle = Q.get('bundle') || 'client/client.js'
+  SHARED.modes = (Q.get('modes') || 'ok,fail,failnocopy').split(',').filter(Boolean)
+</script>
+<script>
+(async function main() {
+  'use strict'
+  const S = window.__SHARED__
+  const React = window.React
+  const ReactDOM = window.ReactDOM
+  const out = []
+  let total = 0
+  let failed = 0
+
+  /** react/jsx-runtime 的等价实现：把 key 还原成 createElement 的 config.key（别塞进 props）。 */
+  function jsxRuntime() {
+    const mk = (type, props, key) => {
+      const rest = Object.assign({}, props || {})
+      delete rest.key
+      return key === undefined ? React.createElement(type, rest) : React.createElement(type, Object.assign(rest, { key }))
+    }
+    return { Fragment: React.Fragment, jsx: mk, jsxs: mk }
+  }
+
+  const wait = (ms) => new Promise((r) => setTimeout(r, ms))
+  async function waitFor(fn, label, budget = 4000) {
+    const t0 = Date.now()
+    for (;;) {
+      let v
+      try { v = fn() } catch { v = undefined }
+      if (v) return v
+      if (Date.now() - t0 > budget) throw new Error('waitFor 超时：' + label)
+      await wait(25)
+    }
+  }
+
+  // 面板数据：两个会话同属一个工作区（cwd 相同）；dirName 与 sessionId 刻意不同——
+  // 提取器是按 dirName 过滤的，指令里必须出现 dirName 才算对。
+  const ROWS = [
+    { sessionId: 'sess-aaa', dirName: 'dir-aaa', workspaceKey: 'wk', cwd: 'D:/workspace/proj', title: '会话A', createdAt: 1, updatedAt: 2, running: false, group: 'workspace' },
+    { sessionId: 'sess-bbb', dirName: 'dir-bbb', workspaceKey: 'wk', cwd: 'D:/workspace/proj', title: '会话B', createdAt: 1, updatedAt: 2, running: false, group: 'workspace' },
+  ]
+  const STATS = { projcacheBytes: 0, totalSessions: 2, archivedCount: 0, workspaceCount: 1 }
+  const LIST = {
+    workspaces: [{ key: 'wk', label: 'proj', path: 'D:/workspace/proj', sessionCount: 2 }],
+    sessions: ROWS,
+    archived: [],
+    stats: STATS,
+  }
+
+  /** 跑一种模式：全新桩 + 全新 React 根，返回该模式的结论行。 */
+  async function runScenario(mode) {
+    const H = { mode, fetchCalls: [], created: [], opened: [], drafts: [], copied: [], draft: '' }
+    const checks = []
+    const check = (name, ok, detail) => checks.push({ name, ok: !!ok, detail: detail === undefined ? '' : String(detail) })
+
+    const ns = 'dsh-knj-session-management'
+    const dicts = {}
+    const t = (key, vars) => {
+      const raw = (dicts[ns] && (dicts[ns].zh[key] || dicts[ns].en[key])) || key
+      return vars ? raw.replace(/\{(\w+)\}/g, (_, k) => String(vars[k])) : raw
+    }
+
+    const sessionsService = {
+      open: (id) => H.opened.push(id),
+      list: { getSnapshot: () => ({ byId: {}, current: undefined }) },
+      refresh: async () => {},
+      create: async (opts) => {
+        H.created.push(opts)
+        // fail / failnocopy 都模拟"新会话建不出来"
+        if (mode !== 'ok') throw new Error('boom: create 失败')
+        return 'new-sess-1'
+      },
+      scope: (id) => (id === 'new-sess-1' ? { sessionId: id } : undefined),
+    }
+    const conversationService = {
+      input: {
+        for: () => ({
+          setDraft: (text) => { H.draft = text; H.drafts.push(text) },
+          state: { getSnapshot: () => ({ draft: H.draft }) },
+        }),
+      },
+    }
+    const workspacesService = {
+      list: { getSnapshot: () => ({ items: [{ workspaceId: 'w1', path: 'D:/workspace/proj' }] }) },
+      refresh: async () => {},
+    }
+
+    // 剪贴板：failnocopy 模式下拒绝写入
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: async (text) => {
+          if (mode === 'failnocopy') throw new Error('clipboard denied')
+          H.copied.push(text)
+        },
+      },
+    })
+
+    window.fetch = async (url) => {
+      const u = String(url)
+      H.fetchCalls.push(u)
+      if (u.endsWith('/list')) return { ok: true, status: 200, json: async () => LIST }
+      return { ok: true, status: 200, json: async () => ({ archived: 0, restored: 0, deleted: 0, skipped: 0, skippedReasons: [], stats: STATS }) }
+    }
+
+    const mod = S.mod.factory((name) => {
+      if (name === 'react') return React
+      if (name === 'react-dom') return ReactDOM
+      if (name === 'react/jsx-runtime' || name === 'react/jsx-dev-runtime') return jsxRuntime()
+      throw new Error('harness: 未打桩的外部依赖 ' + name)
+    })
+
+    let renderEntry = null
+    const ctx = {
+      effect: (cb) => { try { cb() } catch (e) { S.errors.push('effect: ' + e) } },
+      get: (name) => ({ sessions: sessionsService, workspaces: workspacesService, conversation: conversationService })[name],
+      locale: { register: (n, d) => { dicts[n] = d; return {} }, bind: () => t },
+      slots: {
+        inject: (slot, register) => { register(); return slot },
+        register: (meta, render) => { renderEntry = render; return meta },
+      },
+    }
+
+    const container = document.createElement('div')
+    container.className = 'stage'
+    document.getElementById('stages').appendChild(container)
+    const root = ReactDOM.createRoot(container)
+
+    try {
+      if (mode === 'ok') {
+        check('bundle 导出了 inject 且含 conversation（真实服务名，写错会让 fiber pending）',
+          Array.isArray(mod.inject) && mod.inject.includes('conversation'), JSON.stringify(mod.inject))
+      }
+      mod.apply(ctx)
+      if (mode === 'ok') check('apply 注册了侧栏入口并拿到 render', typeof renderEntry === 'function')
+
+      root.render(React.createElement(function Harness() { return renderEntry() }))
+
+      // 1) 打开面板
+      const entryBtn = await waitFor(
+        () => [...container.querySelectorAll('button')].find((b) => b.textContent.includes(t('entry.label'))),
+        '侧栏入口按钮',
+      )
+      entryBtn.click()
+      // 2) 等列表渲染（fetch /list 回来）
+      await waitFor(() => container.querySelectorAll('input[type=checkbox]').length >= 2, '会话行 checkbox')
+      if (mode === 'ok') check('列表已按 /list 渲染出 2 个会话', H.fetchCalls.some((u) => u.endsWith('/list')))
+
+      // 3) 全选（两个会话同工作区，闸门应能确定公共 cwd）
+      for (const cb of container.querySelectorAll('input[type=checkbox]')) cb.click()
+      const gateLabel = t('btn.distillThenArchive')
+      const gateBtn = await waitFor(
+        () => [...container.querySelectorAll('button')].find((b) => b.textContent.includes(gateLabel)),
+        '「蒸馏后归档」闸门按钮',
+      )
+
+      // 4) 点闸门
+      gateBtn.click()
+      await wait(400)
+      const text = container.innerText
+      const dialogShown = text.includes(t('btn.distilledContinue'))
+
+      if (mode === 'ok') {
+        check('点闸门后新建了 1 个会话', H.created.length === 1, JSON.stringify(H.created))
+        check('新会话带上匹配到的工作区与公共 cwd', H.created[0] && H.created[0].workspaceId === 'w1' && H.created[0].cwd === 'D:/workspace/proj', JSON.stringify(H.created[0]))
+        check('新会话被打开（用户能直接切过去）', H.opened.includes('new-sess-1'), JSON.stringify(H.opened))
+        check('草稿确实写进了 composer', H.drafts.length >= 1 && H.draft.length > 0)
+        check('指令按 dirName 点名两个会话（提取器按 dirName 过滤）', H.draft.includes('dir-aaa') && H.draft.includes('dir-bbb'), H.draft.slice(0, 120))
+        check('预填成功时不再谎称"已复制"', H.copied.length === 0, JSON.stringify(H.copied.length))
+        check('出现确认框（删/归档仍必须人工确认）', dialogShown)
+        check('确认框正文说明是"已预填到新会话"', text.includes('预填到新建的会话'))
+      } else if (mode === 'fail') {
+        check('尝试新建会话（失败也留痕）', H.created.length === 1, JSON.stringify(H.created))
+        check('预填失败 → 草稿为空（不假装成功）', H.draft === '', JSON.stringify(H.draft.slice(0, 60)))
+        check('退回复制，且复制的是所选会话的指令', H.copied.length === 1 && H.copied[0].includes('dir-aaa') && H.copied[0].includes('dir-bbb'), JSON.stringify(H.copied.map((x) => x.slice(0, 60))))
+        check('提示如实带上失败原因（boom）', text.includes('boom'))
+        check('确认框正文回落到"已复制"版本', dialogShown && text.includes('蒸馏指令已复制'))
+      } else {
+        check('预填失败且复制失败 → 不出现确认框（绝不放行未蒸馏的删除）', !dialogShown)
+        check('失败时提示里仍带指令原文供手工复制', text.includes('dir-aaa') && text.includes('dir-bbb'))
+      }
+
+      check('未发生任何破坏性请求（没点「继续」就不该归档/删除）',
+        !H.fetchCalls.some((u) => /archive|delete|restore/.test(u)), JSON.stringify(H.fetchCalls))
+    } catch (e) {
+      check('harness 自身未抛错', false, String(e && e.stack ? e.stack : e))
+    }
+
+    try { root.unmount() } catch (e) { check('卸载组件未报错', false, String(e)) }
+    container.remove()
+
+    // 分模式统计错误：key 警告是既有噪音，单列
+    const errs = S.errors.filter((e) => !e.includes(KEY_WARNING))
+    const keyWarnings = S.errors.length - errs.length
+    S.errors.length = 0
+    check('无未捕获错误 / React 报错（key 警告已排除）', errs.length === 0, JSON.stringify(errs))
+
+    const modeFailed = checks.filter((c) => !c.ok).length
+    total += checks.length
+    failed += modeFailed
+    return [
+      `=== mode=${mode}  (${checks.length - modeFailed}/${checks.length})  既有 key 警告 ${keyWarnings} 条（不计入）`,
+      `fetch=${JSON.stringify(H.fetchCalls)}`,
+      `created=${JSON.stringify(H.created)} opened=${JSON.stringify(H.opened)} drafts=${H.drafts.length} copied=${H.copied.length}`,
+      `draft=${JSON.stringify(H.draft.slice(0, 200))}`,
+      ...checks.map((c) => `${c.ok ? 'PASS' : 'FAIL'} ${c.name}${c.detail ? ' :: ' + c.detail : ''}`),
+    ]
+  }
+
+  try {
+    // bundle 只加载一次（三种模式共用同一份产物字节）
+    await new Promise((resolve, reject) => {
+      const s = document.createElement('script')
+      s.src = S.bundle
+      s.onload = () => resolve()
+      s.onerror = () => reject(new Error('bundle 加载失败：' + S.bundle))
+      document.head.appendChild(s)
+    })
+    out.push(`bundle=${S.bundle}`)
+    for (const mode of S.modes) out.push(...(await runScenario(mode)), '')
+  } catch (e) {
+    failed += 1
+    total += 1
+    out.push('FAIL harness 顶层未抛错 :: ' + String(e && e.stack ? e.stack : e))
+  }
+
+  const verdict = failed === 0 ? 'ALL PASS' : failed + ' FAILED'
+  out.push('===', `RESULT ${verdict} (${total - failed}/${total} checks)`)
+  document.getElementById('result').textContent = out.join('\n')
+  document.title = failed === 0 ? 'HARNESS-ALL-PASS' : 'HARNESS-FAILED'
+})()
+</script>
+</body>
+</html>
