@@ -41,6 +41,16 @@ export interface ArchiveRecord {
   title?: string
   archivedAt: number
   sizeBytes?: number
+  /**
+   * True when the host already hides this session but its files still sit in
+   * the sessions tree: the move is deferred (live session object, transient
+   * IO error) and `ArchiveOps.sweep()` reclaims it later.
+   */
+  pendingMove?: boolean
+  /** Why the move was deferred. `conflict` requires a human decision. */
+  pendingReason?: 'live' | 'move-failed' | 'conflict'
+  /** Underlying error text for `move-failed` / `conflict`. */
+  pendingDetail?: string
 }
 
 export interface ArchiveStoreFile {
@@ -67,6 +77,12 @@ export interface SessionRow {
   parentSessionId?: string
   /** Host header delegation depth (0 = top-level). */
   delegationDepth?: number
+  /**
+   * True when the host already lists this id as archived but its directory is
+   * still in the sessions tree (archived before this plugin knew about the
+   * host registry). The panel offers a one-click "finish archiving" action.
+   */
+  hostArchived?: boolean
 }
 
 /** Workspace group summary returned by the list endpoint. */
@@ -79,20 +95,43 @@ export interface WorkspaceGroup {
   totalBytes?: number
 }
 
+/** Reconciliation between the host's archive set and our on-disk records. */
+export interface ArchiveDrift {
+  /** Archived per the host, but still sitting in the sessions tree. */
+  pending: string[]
+  /** Pending records that cannot converge without manual help. */
+  conflict: string[]
+  /** Records whose directory exists in neither tree. */
+  missing: string[]
+  /** Registry ids this plugin holds no record for (host archived them alone). */
+  hostOnly: string[]
+  /** Our records the registry no longer considers archived. */
+  storeOnly: string[]
+}
+
 export interface SessionListResponse {
   workspaces: WorkspaceGroup[]
   sessions: SessionRow[]
   archived: ArchiveRecord[]
+  /** Every session id the host currently hides (source of truth for visibility). */
+  hostArchived: string[]
+  drift: ArchiveDrift
   stats: {
     projcacheBytes: number
     totalSessions: number
     archivedCount: number
     workspaceCount: number
+    /** Archive records whose files are still waiting to move. */
+    pendingCount: number
+    /** Sessions the host hides but this plugin has not filed yet. */
+    hostArchivedCount: number
   }
 }
 
 export interface ArchiveResult {
   archived: number
+  pending: number
+  already: number
   skipped: number
   skippedReasons: string[]
   stats: SessionListResponse['stats']

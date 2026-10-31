@@ -71,6 +71,55 @@ export interface DiscoveredSession {
   delegationDepth?: number
 }
 
+/**
+ * Session log file names carry the session-format generation:
+ * `session.jsonl` (v0) and, since format v1, `session.v<N>.jsonl[.zstd]`.
+ * The host writes the generation it was built against (currently v4), so
+ * matching the literal `session.jsonl` alone silently hid almost every
+ * session. Keep this in sync with dsh-session-format's
+ * `sessionFormatLogFilename()`; unknown future generations still match.
+ */
+const LOG_NAME_RE = /^session(?:\.v(\d{1,3}))?\.jsonl(?:\.zstd)?$/
+
+export interface LogFileName {
+  name: string
+  /** 0 for the unversioned `session.jsonl` form. */
+  version: number
+  compressed: boolean
+}
+
+/** Parse one entry of a session directory, or undefined when it is not a log. */
+export function parseLogFileName(name: string): LogFileName | undefined {
+  const match = LOG_NAME_RE.exec(name)
+  if (match === null) return undefined
+  return {
+    name,
+    version: match[1] === undefined ? 0 : Number(match[1]),
+    compressed: name.endsWith('.zstd'),
+  }
+}
+
+/**
+ * Pick the log a session directory should be read from: the highest format
+ * generation wins (an interrupted upgrade can leave the previous log behind),
+ * and within one generation the compressed file is the live copy.
+ */
+export function pickLogFile(names: readonly string[]): string | undefined {
+  let best: LogFileName | undefined
+  for (const name of names) {
+    const parsed = parseLogFileName(name)
+    if (parsed === undefined) continue
+    if (
+      best === undefined ||
+      parsed.version > best.version ||
+      (parsed.version === best.version && parsed.compressed && !best.compressed)
+    ) {
+      best = parsed
+    }
+  }
+  return best?.name
+}
+
 /** Read the first (header) line of a session log, zstd-aware. */
 export function readHeaderLine(logPath: string): Record<string, unknown> | undefined {
   try {
@@ -159,21 +208,27 @@ export function discoverSessions(disc: SessionDiscovery): { groups: WorkspaceGro
 
     for (const dirName of sessionDirs) {
       const sessionDir = join(projectPath, dirName)
-      let sizeBytes = 0
-      let logPath: string | undefined
+      let names: string[]
       try {
-        for (const f of readdirSync(sessionDir)) {
-          if (f === 'session.jsonl' || f === 'session.jsonl.zstd') logPath = join(sessionDir, f)
-          try {
-            sizeBytes += statSync(join(sessionDir, f)).size
-          } catch {
-            /* ignore */
-          }
-        }
+        names = readdirSync(sessionDir)
       } catch {
         continue
       }
-      if (logPath === undefined) continue
+      // Generation-aware: session.v4.jsonl.zstd on current hosts.
+      const logName = pickLogFile(names)
+      if (logName === undefined) continue
+      const logPath = join(sessionDir, logName)
+      let sizeBytes = 0
+      let logMtime = 0
+      for (const f of names) {
+        try {
+          const stat = statSync(join(sessionDir, f))
+          sizeBytes += stat.size
+          if (f === logName) logMtime = stat.mtimeMs
+        } catch {
+          /* ignore */
+        }
+      }
 
       const header = readHeaderLine(logPath)
       const { id, cwd, createdAt, parentSessionId, delegationDepth } = parseHeader(header, dirName)
@@ -184,7 +239,8 @@ export function discoverSessions(disc: SessionDiscovery): { groups: WorkspaceGro
       // has no title field); fall back to the header's own title if present.
       const headerTitle = typeof header?.['title'] === 'string' ? (header['title'] as string) : undefined
       const title = headerTitle ?? disc.titleOf?.(id)
-      const updatedAt = createdAt // header carries createdAt; updatedAt approximated (see D6)
+      // The log's mtime is the last activity; the header only records birth.
+      const updatedAt = Math.max(createdAt, logMtime)
       const row: SessionRow = {
         sessionId: id,
         dirName,

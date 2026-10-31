@@ -1,19 +1,23 @@
 /**
  * HTTP routes bridging the browser archive panel to the host. This layer only
- * parses requests, calls the discovery/archive operations, and serializes
+ * parses requests, calls ArchiveOps (host registry + filesystem), and serializes
  * responses. Security: every mutating route accepts same-origin POST only,
  * validates the session id against a whitelist, and requires `confirm: true`
  * for permanent deletion.
+ *
+ * Archive semantics live in archive-ops.ts; see
+ * docs/adr/0001-host-authoritative-archive.md.
  */
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Context } from '@deepseek-ai/cordis'
 import type { ArchiveStore } from './store.ts'
 import type { SessionDiscovery } from './fs.ts'
-import { archiveSession, collectSessionTree, deleteArchiveDir, discoverSessions, restoreSession } from './fs.ts'
+import { discoverSessions } from './fs.ts'
+import { ArchiveOps } from './archive-ops.ts'
 import type { PolicyConfig } from './policy.ts'
 import { selectForArchive } from './policy.ts'
 import type { ArchiveRecord, ArchiveResult, SessionListResponse } from './types.ts'
-import { NO_CWD_KEY, validateSessionId } from './types.ts'
+import { validateSessionId } from './types.ts'
 
 export interface WebServerService {
   register(route: {
@@ -48,9 +52,17 @@ export interface RouteDeps {
   projcacheBytes(): number
   policy: PolicyConfig
   attachedIds(): Set<string>
+  /**
+   * The host-aware archive engine. index.ts injects the real one (workspace
+   * registry + sweep); when omitted (bare unit tests, hosts without a
+   * registry) a degraded file-only engine is derived from `attachedIds()`.
+   */
+  ops?: ArchiveOps
 }
 
 export function mountArchiveRoutes(host: ArchiveHost, _ctx: Context, deps: RouteDeps): () => void {
+  const ops = deps.ops ?? fileOnlyOps(deps)
+
   const handler = async (request: IncomingMessage, response: ServerResponse): Promise<void> => {
     const url = new URL(request.url ?? '/', 'http://localhost')
     const path = url.pathname
@@ -59,17 +71,16 @@ export function mountArchiveRoutes(host: ArchiveHost, _ctx: Context, deps: Route
       // ---- GET /list ----
       if (path === `${BASE}/list` && method === 'GET') {
         const { groups, rows } = discoverSessions(deps.disc)
-        const archived = deps.store.list().map((r) => ({ ...r }))
+        ops.markHostArchived(rows)
+        const archived = deps.store.list().map((record) => ({ ...record }))
+        const drift = ops.drift()
         const payload: SessionListResponse = {
           workspaces: groups,
           sessions: rows,
           archived,
-          stats: {
-            projcacheBytes: deps.projcacheBytes(),
-            totalSessions: rows.length,
-            archivedCount: archived.length,
-            workspaceCount: groups.length,
-          },
+          hostArchived: [...ops.hostArchivedIds()],
+          drift,
+          stats: statsOf(deps, ops, rows.length, groups.length, archived.length, drift),
         }
         return sendJson(response, 200, payload)
       }
@@ -80,30 +91,20 @@ export function mountArchiveRoutes(host: ArchiveHost, _ctx: Context, deps: Route
         const body = await readJsonBody(request)
         const sessionId = validateSessionId((body as { sessionId?: unknown })?.sessionId)
         const { rows } = discoverSessions(deps.disc)
-        const row = rows.find((r) => r.sessionId === sessionId)
+        const row = rows.find((candidate) => candidate.sessionId === sessionId)
         if (row === undefined) return sendJson(response, 404, { error: `session not found: ${sessionId}` })
         if (row.running || deps.attachedIds().has(sessionId)) {
           return sendJson(response, 409, { error: 'session is running / 会话正在运行' })
         }
-        // Archive the whole tree: root + all descendant subagents.
-        const tree = collectSessionTree(rows, sessionId)
-        const skippedReasons: string[] = []
-        let archived = 0
-        for (const member of tree) {
-          try {
-            const record = archiveSession(deps.disc, member, member.dirName)
-            deps.store.add(record)
-            deleteProjcacheEntry(deps, member.sessionId)
-            archived += 1
-          } catch (error) {
-            skippedReasons.push(`${member.sessionId}: ${String(error)}`)
-          }
-        }
+        // Root + descendant subagents go together, visible-first then on disk.
+        const batch = await ops.archiveTree(rows, sessionId)
         const result: ArchiveResult = {
-          archived,
-          skipped: tree.length - archived,
-          skippedReasons,
-          stats: freshStats(deps),
+          archived: batch.archived,
+          pending: batch.pending,
+          already: batch.already,
+          skipped: batch.skipped,
+          skippedReasons: batch.skippedReasons,
+          stats: freshStats(deps, ops),
         }
         return sendJson(response, 200, result)
       }
@@ -114,24 +115,23 @@ export function mountArchiveRoutes(host: ArchiveHost, _ctx: Context, deps: Route
         const body = await readJsonBody(request)
         const sessionId = validateSessionId((body as { sessionId?: unknown })?.sessionId)
         const records = treeRecords(deps, sessionId)
-        if (records.length === 0) return sendJson(response, 404, { error: `archived session not found: ${sessionId}` })
-        let restored = 0
-        for (const record of records) {
-          try {
-            restoreSession(deps.disc, record)
-            deps.store.remove(record.sessionId)
-            // Write the captured title back into the projection cache so the
-            // restored session shows its title again (archiving deleted the
-            // projcache record, which was the title's live source).
-            if (record.title !== undefined && record.title !== '') {
-              restoreProjcacheTitle(deps, record.sessionId, record.title)
-            }
-            restored += 1
-          } catch {
-            /* keep going; a failed member leaves its archive record in place */
+        if (records.length === 0) {
+          // Never filed by this plugin: the host may still hide it (host-only
+          // archive). Clearing the host mark is then the whole restore.
+          const outcome = await ops.restore(sessionId)
+          if (outcome.status === 'unarchived') {
+            return sendJson(response, 200, { restored: 1, unarchived: 1, stats: freshStats(deps, ops) })
           }
+          return sendJson(response, 404, { error: `archived session not found: ${sessionId}` })
         }
-        return sendJson(response, 200, { restored, stats: freshStats(deps) })
+        let restored = 0
+        const skippedReasons: string[] = []
+        for (const record of records) {
+          const outcome = await ops.restore(record.sessionId)
+          if (outcome.status === 'restored' || outcome.status === 'unarchived') restored += 1
+          else skippedReasons.push(`${record.sessionId}: ${outcome.reason ?? outcome.status}`)
+        }
+        return sendJson(response, 200, { restored, skipped: records.length - restored, skippedReasons, stats: freshStats(deps, ops) })
       }
 
       // ---- POST /delete {sessionId, confirm: true} ----
@@ -142,49 +142,49 @@ export function mountArchiveRoutes(host: ArchiveHost, _ctx: Context, deps: Route
         if ((body as { confirm?: unknown })?.confirm !== true) {
           return sendJson(response, 400, { error: 'deletion requires confirm: true / 删除需二次确认' })
         }
-        const records = treeRecords(deps, sessionId)
-        if (records.length === 0) return sendJson(response, 404, { error: `archived session not found: ${sessionId}` })
         if (deps.attachedIds().has(sessionId)) {
           return sendJson(response, 409, { error: 'session is running / 会话正在运行' })
         }
+        const records = treeRecords(deps, sessionId)
+        if (records.length === 0) return sendJson(response, 404, { error: `archived session not found: ${sessionId}` })
         let deleted = 0
+        const skippedReasons: string[] = []
         for (const record of records) {
-          try {
-            deleteArchiveDir(deps.disc, record)
-            deps.store.remove(record.sessionId)
-            deleteProjcacheEntry(deps, record.sessionId)
-            deleted += 1
-          } catch {
-            /* keep going */
-          }
+          const outcome = await ops.purge(record.sessionId)
+          if (outcome.status === 'deleted') deleted += 1
+          else skippedReasons.push(`${record.sessionId}: ${outcome.reason ?? outcome.status}`)
         }
-        return sendJson(response, 200, { deleted, stats: freshStats(deps) })
+        if (deleted === 0 && skippedReasons.length > 0) {
+          // Nothing could be removed: report the blocking reason instead of a
+          // misleading 200 with zero deletions.
+          return sendJson(response, 409, { error: skippedReasons.join('; '), deleted, skippedReasons })
+        }
+        return sendJson(response, 200, { deleted, skipped: records.length - deleted, skippedReasons, stats: freshStats(deps, ops) })
       }
 
       // ---- POST /run-policy (idempotent) ----
       if (path === `${BASE}/run-policy` && method === 'POST') {
         if (!sameOrigin(request)) return sendJson(response, 403, { error: 'untrusted origin / 非可信来源' })
         const { rows } = discoverSessions(deps.disc)
+        ops.markHostArchived(rows)
         const selected = selectForArchive(rows, deps.policy)
-        let archived = 0
-        const skippedReasons: string[] = []
-        for (const row of selected) {
-          try {
-            const record = archiveSession(deps.disc, row, row.dirName)
-            deps.store.add(record)
-            deleteProjcacheEntry(deps, row.sessionId)
-            archived += 1
-          } catch (error) {
-            skippedReasons.push(`${row.sessionId}: ${String(error)}`)
-          }
-        }
+        const batch = await ops.archiveRows(selected)
         const result: ArchiveResult = {
-          archived,
-          skipped: selected.length - archived,
-          skippedReasons,
-          stats: freshStats(deps),
+          archived: batch.archived,
+          pending: batch.pending,
+          already: batch.already,
+          skipped: batch.skipped,
+          skippedReasons: batch.skippedReasons,
+          stats: freshStats(deps, ops),
         }
         return sendJson(response, 200, result)
+      }
+
+      // ---- POST /sweep (retry deferred moves) ----
+      if (path === `${BASE}/sweep` && method === 'POST') {
+        if (!sameOrigin(request)) return sendJson(response, 403, { error: 'untrusted origin / 非可信来源' })
+        const report = await ops.sweep()
+        return sendJson(response, 200, { ...report, stats: freshStats(deps, ops) })
       }
 
       return sendJson(response, 404, { error: `no such route: ${method} ${path}` })
@@ -203,6 +203,17 @@ export function mountArchiveRoutes(host: ArchiveHost, _ctx: Context, deps: Route
   return () => {
     disposer()
   }
+}
+
+/** File-only engine for hosts without a workspace registry (or bare deps). */
+export function fileOnlyOps(deps: RouteDeps): ArchiveOps {
+  return new ArchiveOps({
+    store: deps.store,
+    disc: deps.disc,
+    isLive: (sessionId) => deps.attachedIds().has(sessionId),
+    dropProjcache: (sessionId) => deleteProjcacheEntry(deps, sessionId),
+    restoreTitle: (sessionId, title) => restoreProjcacheTitle(deps, sessionId, title),
+  })
 }
 
 /**
@@ -273,14 +284,28 @@ function restoreProjcacheTitle(deps: RouteDeps, sessionId: string, title: string
   }
 }
 
-function freshStats(deps: RouteDeps): SessionListResponse['stats'] {
-  const { groups, rows } = discoverSessions(deps.disc)
+function statsOf(
+  deps: RouteDeps,
+  ops: ArchiveOps,
+  totalSessions: number,
+  workspaceCount: number,
+  archivedCount: number,
+  drift: ReturnType<ArchiveOps['drift']>,
+): SessionListResponse['stats'] {
   return {
     projcacheBytes: deps.projcacheBytes(),
-    totalSessions: rows.length,
-    archivedCount: deps.store.list().length,
-    workspaceCount: groups.length,
+    totalSessions,
+    archivedCount,
+    workspaceCount,
+    pendingCount: drift.pending.length,
+    hostArchivedCount: drift.hostOnly.length + drift.pending.length,
   }
+}
+
+function freshStats(deps: RouteDeps, ops: ArchiveOps): SessionListResponse['stats'] {
+  const { groups, rows } = discoverSessions(deps.disc)
+  ops.markHostArchived(rows)
+  return statsOf(deps, ops, rows.length, groups.length, deps.store.list().length, ops.drift())
 }
 
 function sendJson(response: ServerResponse, status: number, payload: unknown): void {

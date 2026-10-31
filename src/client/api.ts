@@ -41,6 +41,8 @@ export interface SessionRowView {
   sizeBytes?: number
   parentSessionId?: string
   delegationDepth?: number
+  /** The host already hides this session but its files remain in the tree. */
+  hostArchived?: boolean
 }
 
 export interface ArchiveRecordView {
@@ -52,6 +54,18 @@ export interface ArchiveRecordView {
   parentSessionId?: string
   archivedAt: number
   sizeBytes?: number
+  /** Files are still in the sessions tree; sweep() will finish the move. */
+  pendingMove?: boolean
+  pendingReason?: 'live' | 'move-failed' | 'conflict'
+  pendingDetail?: string
+}
+
+export interface DriftView {
+  pending: string[]
+  conflict: string[]
+  missing: string[]
+  hostOnly: string[]
+  storeOnly: string[]
 }
 
 export interface StatsView {
@@ -59,19 +73,35 @@ export interface StatsView {
   totalSessions: number
   archivedCount: number
   workspaceCount: number
+  /** Archive records waiting for their directory move. */
+  pendingCount: number
+  /** Sessions the host hides that this plugin has not filed yet. */
+  hostArchivedCount: number
 }
 
 export interface SessionListResponse {
   workspaces: WorkspaceGroupView[]
   sessions: SessionRowView[]
   archived: ArchiveRecordView[]
+  hostArchived: string[]
+  drift: DriftView
   stats: StatsView
 }
 
 export interface ArchiveResult {
   archived: number
+  pending: number
+  already: number
   skipped: number
   skippedReasons: string[]
+  stats: StatsView
+}
+
+export interface SweepResult {
+  moved: number
+  skipped: number
+  failed: number
+  reasons: string[]
   stats: StatsView
 }
 
@@ -86,15 +116,19 @@ export function archiveSession(sessionId: string): Promise<ArchiveResult> {
   })
 }
 
-export function restoreSession(sessionId: string): Promise<{ restored: number; stats: StatsView }> {
-  return api<{ restored: number; stats: StatsView }>('/dsh-knj-session-management/restore', {
+export function restoreSession(
+  sessionId: string,
+): Promise<{ restored: number; unarchived?: number; skipped?: number; skippedReasons?: string[]; stats: StatsView }> {
+  return api('/dsh-knj-session-management/restore', {
     method: 'POST',
     body: JSON.stringify({ sessionId }),
   })
 }
 
-export function deleteSession(sessionId: string): Promise<{ deleted: number; stats: StatsView }> {
-  return api<{ deleted: number; stats: StatsView }>('/dsh-knj-session-management/delete', {
+export function deleteSession(
+  sessionId: string,
+): Promise<{ deleted: number; skipped?: number; skippedReasons?: string[]; stats: StatsView }> {
+  return api('/dsh-knj-session-management/delete', {
     method: 'POST',
     body: JSON.stringify({ sessionId, confirm: true }),
   })
@@ -102,6 +136,13 @@ export function deleteSession(sessionId: string): Promise<{ deleted: number; sta
 
 export function runPolicy(): Promise<ArchiveResult> {
   return api<ArchiveResult>('/dsh-knj-session-management/run-policy', {
+    method: 'POST',
+    body: JSON.stringify({}),
+  })
+}
+
+export function sweep(): Promise<SweepResult> {
+  return api<SweepResult>('/dsh-knj-session-management/sweep', {
     method: 'POST',
     body: JSON.stringify({}),
   })

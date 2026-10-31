@@ -1,15 +1,28 @@
 /**
- * dsh-knj-session-management host entry: mounts the archive HTTP routes, the archive
- * store, and runs the auto-archive policy once at boot (when enabled).
+ * dsh-knj-session-management host entry: mounts the archive HTTP routes, the
+ * archive store, and runs the deferred-move sweep + auto-archive policy once at
+ * boot.
+ *
+ * Archive visibility belongs to the host (`ctx.workspaceRegistry`
+ * `archivedSessionIds`); this plugin owns the disk move. See
+ * docs/adr/0001-host-authoritative-archive.md.
  */
 import { homedir } from 'node:os'
 import { existsSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { ArchiveStore } from './store.ts'
-import { archiveSession, discoverSessions, type SessionDiscovery } from './fs.ts'
+import { discoverSessions, type SessionDiscovery } from './fs.ts'
+import { ArchiveOps } from './archive-ops.ts'
+import { resolveWorkspaceRegistry, type ServiceBag } from './host-registry.ts'
 import { selectForArchive, type PolicyConfig } from './policy.ts'
-import { mountArchiveRoutes, type ArchiveHost, type ProjcacheDeleter, type RouteDeps } from './routes.ts'
+import {
+  fileOnlyOps,
+  mountArchiveRoutes,
+  type ArchiveHost,
+  type ProjcacheDeleter,
+  type RouteDeps,
+} from './routes.ts'
 
 export const name = 'dsh-knj-session-management'
 
@@ -36,8 +49,12 @@ interface HostServices {
 }
 
 export function apply(ctx: Context, config?: Config): void {
+  // workspaceRegistry is deliberately NOT in the inject list: the plugin must
+  // also load on hosts (and in tests) that have no registry. It is resolved
+  // lazily on every use instead, so a late-created service is still found.
   ctx.inject(['webServer', 'loader', 'sessions', 'agents', 'sessionProjectionCache'], (hostCtx: Context) => {
     const host = hostCtx as unknown as ArchiveHost & { get<T>(key: string): T | undefined }
+    const bag = hostCtx as unknown as ServiceBag
     const sessions = host.get<HostServices['sessions']>('sessions')
     const agents = host.get<HostServices['agents']>('agents')
     const projcache = host.get<ProjcacheDeleter>('sessionProjectionCache')
@@ -79,6 +96,32 @@ export function apply(ctx: Context, config?: Config): void {
       },
     }
 
+    /**
+     * Live = the host still holds the session in memory (or its agent runs).
+     * Moving the directory under a resident writer would corrupt it, so those
+     * archives are hidden first and their files reclaimed by sweep() later.
+     */
+    const isLive = (id: string): boolean => {
+      if (agents !== undefined && agents.get(id)?.status === 'running') return true
+      try {
+        return sessions?.get(id) !== undefined
+      } catch {
+        return true
+      }
+    }
+
+    const ops = new ArchiveOps({
+      store,
+      disc,
+      isLive,
+      // Lazy: re-resolved per operation, so a registry created after us works.
+      get registry() {
+        return resolveWorkspaceRegistry(bag)
+      },
+      dropProjcache: (id) => deleteProjcacheEntry(projcache, id),
+      restoreTitle: (id, title) => restoreProjcacheTitle(projcache, id, title),
+    })
+
     const deps: RouteDeps = {
       store,
       disc,
@@ -87,6 +130,7 @@ export function apply(ctx: Context, config?: Config): void {
       projcache,
       projcacheBytes: () => projcacheFileSize(),
       policy,
+      ops,
       attachedIds: () => {
         // Only truly-running agents are protected from archive; idle sessions
         // that merely exist in the sessions store are archivable.
@@ -104,12 +148,27 @@ export function apply(ctx: Context, config?: Config): void {
 
     const disposeRoutes = mountArchiveRoutes(host, ctx, deps)
 
-    // Run the auto-archive policy once at boot (idempotent, fail-soft).
-    if (policy.enabled && policy.maxSessionsPerWorkspace > 0) {
-      void runPolicy(deps).catch((error) => {
-        ctx.logger?.warn?.(`[dsh-knj-session-management] boot policy run failed: ${String(error)}`)
-      })
+    if (ops.degraded) {
+      ctx.logger?.warn?.(
+        '[dsh-knj-session-management] host workspace registry unavailable: archives move files only and the sidebar may keep showing them',
+      )
     }
+
+    // Boot work, in order: reclaim deferred moves from a previous run, then run
+    // the auto-archive policy (idempotent, fail-soft).
+    void (async () => {
+      try {
+        const swept = await ops.sweep()
+        if (swept.moved > 0) {
+          ctx.logger?.info?.(`[dsh-knj-session-management] reclaimed ${swept.moved} deferred archive move(s)`)
+        }
+        if (policy.enabled && policy.maxSessionsPerWorkspace > 0) {
+          await runPolicy(deps)
+        }
+      } catch (error) {
+        ctx.logger?.warn?.(`[dsh-knj-session-management] boot maintenance failed: ${String(error)}`)
+      }
+    })()
 
     return () => {
       disposeRoutes()
@@ -118,28 +177,46 @@ export function apply(ctx: Context, config?: Config): void {
 }
 
 /** Execute the policy: archive oldest over-cap sessions per workspace. */
-export async function runPolicy(deps: RouteDeps): Promise<{ archived: number; skipped: number }> {
+export async function runPolicy(deps: RouteDeps): Promise<{ archived: number; pending: number; skipped: number }> {
+  const ops = deps.ops ?? fileOnlyOps(deps)
   const { rows } = discoverSessions(deps.disc)
+  ops.markHostArchived(rows)
   const selected = selectForArchive(rows, deps.policy)
-  let archived = 0
-  let skipped = 0
-  for (const row of selected) {
-    try {
-      const record = archiveSession(deps.disc, row, row.dirName)
-      deps.store.add(record)
-      const table = deps.projcache?.table
-      if (table !== undefined) {
-        const result = table.delete(row.sessionId)
-        if (result !== undefined && typeof (result as Promise<unknown>).catch === 'function') {
-          ;(result as Promise<unknown>).catch(() => undefined)
-        }
-      }
-      archived += 1
-    } catch {
-      skipped += 1
+  const batch = await ops.archiveRows(selected)
+  return { archived: batch.archived, pending: batch.pending, skipped: batch.skipped }
+}
+
+function deleteProjcacheEntry(projcache: ProjcacheDeleter | undefined, sessionId: string): void {
+  try {
+    const table = projcache?.table
+    if (table === undefined) return
+    const result = table.delete(sessionId)
+    if (result !== undefined && typeof (result as Promise<unknown>).catch === 'function') {
+      ;(result as Promise<unknown>).catch(() => undefined)
     }
+  } catch {
+    /* fail-soft: a stale cache row costs volume only, never correctness */
   }
-  return { archived, skipped }
+}
+
+function restoreProjcacheTitle(projcache: ProjcacheDeleter | undefined, sessionId: string, title: string): void {
+  try {
+    const table = projcache?.table
+    const put = table?.put
+    if (table === undefined || put === undefined) return
+    const existing = typeof table.get === 'function' ? table.get(sessionId) : undefined
+    const identity = existing?.identity ?? { createdAt: Date.now() }
+    const rows = {
+      ...(existing?.rows ?? {}),
+      title: { ver: 1, seq: Date.now(), val: title },
+    }
+    const result = put(sessionId, { identity, rows })
+    if (result !== undefined && typeof (result as Promise<unknown>).catch === 'function') {
+      ;(result as Promise<unknown>).catch(() => undefined)
+    }
+  } catch {
+    /* fail-soft: title missing from cache only degrades display */
+  }
 }
 
 function projcacheFileSize(): number {

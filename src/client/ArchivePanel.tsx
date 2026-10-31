@@ -370,28 +370,33 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
     async (ids: string[]) => {
       if (ids.length === 0) return
       setBusy('archive')
-      const skipped: string[] = []
       let done = 0
+      let pending = 0
+      let failed = 0
       try {
         for (const id of ids) {
           try {
             const r = await api.archiveSession(id)
             done += r.archived
+            pending += r.pending
             updateStats(r.stats)
-          } catch (error) {
-            const msg = error instanceof Error ? error.message : String(error)
-            if (msg.includes('running')) skipped.push(id)
-            else throw error
+          } catch {
+            // Never abort the batch on one session (running, conflict, IO):
+            // the host may already have archived the others, and a rejected
+            // row used to abort before the list was reloaded at all.
+            failed += 1
           }
         }
-        if (skipped.length === 0) showToast('ok', t('archive.done', { count: done }))
-        else showToast('warn', t('archive.partial', { count: done, skipped: skipped.length }))
+        if (pending > 0) showToast('warn', t('archive.pending', { count: done, pending }))
+        else if (failed > 0) showToast('warn', t('archive.skipped', { count: done, skipped: failed }))
+        else showToast('ok', t('archive.done', { count: done }))
         setSelected(new Set())
-        await load()
-        if (done > 0) syncSidebar()
-      } catch (error) {
-        showToast('err', t('archive.failed', { reason: error instanceof Error ? error.message : String(error) }))
       } finally {
+        // The sidebar hides sessions through the host's archive set, which may
+        // have changed even when the directory move was deferred — always
+        // reload and resync (the old `if (done > 0)` guard left the list stale).
+        await load()
+        syncSidebar()
         setBusy(null)
       }
     },
@@ -402,20 +407,24 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
     async (ids: string[]) => {
       if (ids.length === 0) return
       setBusy('restore')
+      let done = 0
+      let failed = 0
       try {
-        let done = 0
         for (const id of ids) {
-          const r = await api.restoreSession(id)
-          done += r.restored
-          updateStats(r.stats)
+          try {
+            const r = await api.restoreSession(id)
+            done += r.restored
+            updateStats(r.stats)
+          } catch {
+            failed += 1
+          }
         }
-        showToast('ok', t('restore.done', { count: done }))
+        if (failed > 0) showToast('warn', t('archive.skipped', { count: done, skipped: failed }))
+        else showToast('ok', t('restore.done', { count: done }))
         setArchivedSelected(new Set())
-        await load()
-        if (done > 0) syncSidebar()
-      } catch (error) {
-        showToast('err', error instanceof Error ? error.message : String(error))
       } finally {
+        await load()
+        syncSidebar()
         setBusy(null)
       }
     },
@@ -426,42 +435,65 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
     async (ids: string[]) => {
       if (ids.length === 0) return
       setBusy('delete')
+      let done = 0
+      let failed = 0
       try {
         for (const id of ids) {
-          const r = await api.deleteSession(id)
-          updateStats(r.stats)
+          try {
+            const r = await api.deleteSession(id)
+            done += r.deleted
+            updateStats(r.stats)
+          } catch {
+            failed += 1
+          }
         }
-        showToast('ok', t('delete.done', { count: ids.length }))
+        if (failed > 0) showToast('warn', t('archive.skipped', { count: done, skipped: failed }))
+        else showToast('ok', t('delete.done', { count: done }))
         setArchivedSelected(new Set())
+      } finally {
         setConfirmDelete(null)
         await load()
         syncSidebar()
-      } catch (error) {
-        showToast('err', error instanceof Error ? error.message : String(error))
-        setConfirmDelete(null)
-      } finally {
         setBusy(null)
       }
     },
     [load, showToast, syncSidebar, t, updateStats],
   )
 
+  /** Retry deferred directory moves (a pending record is already hidden). */
+  const doSweep = useCallback(async () => {
+    setBusy('sweep')
+    try {
+      const r = await api.sweep()
+      updateStats(r.stats)
+      showToast('ok', r.moved > 0 ? t('sweep.done', { moved: r.moved }) : t('sweep.none'))
+    } catch (error) {
+      showToast('err', error instanceof Error ? error.message : String(error))
+    } finally {
+      await load()
+      syncSidebar()
+      setBusy(null)
+    }
+  }, [load, showToast, syncSidebar, t, updateStats])
+
   const doRunPolicy = useCallback(async () => {
     if (policyPreview === null) return
     setBusy('policy')
     try {
       const r = await api.runPolicy()
-      showToast('ok', t('policy.done', { count: r.archived }))
+      updateStats(r.stats)
+      if (r.pending > 0) showToast('warn', t('archive.pending', { count: r.archived, pending: r.pending }))
+      else showToast('ok', t('policy.done', { count: r.archived }))
       setPolicyPreview(null)
-      await load()
-      if (r.archived > 0) syncSidebar()
     } catch (error) {
       showToast('err', error instanceof Error ? error.message : String(error))
       setPolicyPreview(null)
     } finally {
+      await load()
+      syncSidebar()
       setBusy(null)
     }
-  }, [load, policyPreview, showToast, syncSidebar, t])
+  }, [load, policyPreview, showToast, syncSidebar, t, updateStats])
 
   const stats = data?.stats
 
@@ -527,6 +559,7 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
           <StatCard label={t('stat.sessions')} value={String(stats.totalSessions)} />
           <StatCard label={t('stat.archived')} value={String(stats.archivedCount)} />
           <StatCard label={t('stat.workspaces')} value={String(stats.workspaceCount)} />
+          {stats.pendingCount > 0 && <StatCard label={t('stat.pending')} value={String(stats.pendingCount)} />}
         </div>
       )}
 
@@ -545,6 +578,11 @@ export function ArchivePanel({ onClose, t, sessions, workspaces, startAgentSessi
           {t('tab.archived')} {data ? `(${data.archived.length})` : ''}
         </button>
         <div style={S.spacer} />
+        {stats !== undefined && stats.pendingCount > 0 && (
+          <button type="button" style={S.iconBtn} title={t('archive.restartHint')} disabled={busy !== null} onClick={() => void doSweep()}>
+            <IconRestore size={15} /> {t('btn.sweep')}
+          </button>
+        )}
         <button type="button" style={S.iconBtn} title={t('btn.runPolicy')} disabled={busy !== null} onClick={() => {
           const over = data ? policyOverflow(data) : 0
           setPolicyPreview(over)
@@ -828,6 +866,11 @@ function CurrentList(props: {
                       </div>
                     </div>
                     {row.running && <span style={S.badge}>{t('status.running')}</span>}
+                    {row.hostArchived === true && !row.running && (
+                      <span style={{ ...S.badge, background: 'transparent', border: `1px solid ${T.border}`, color: T.warn }} title={t('archive.restartHint')}>
+                        {t('badge.hostArchived')}
+                      </span>
+                    )}
                     <button
                       type="button"
                       style={S.iconBtn}
@@ -842,10 +885,10 @@ function CurrentList(props: {
                         type="button"
                         style={S.iconBtn}
                         disabled={busy !== null}
-                        title={t('btn.archive')}
+                        title={row.hostArchived === true ? t('btn.finishArchive') : t('btn.archive')}
                         onClick={() => onArchive(row.sessionId)}
                       >
-                        <IconArchive size={14} /> {t('btn.archive')}
+                        <IconArchive size={14} /> {row.hostArchived === true ? t('btn.finishArchive') : t('btn.archive')}
                       </button>
                     )}
                     <button type="button" style={S.iconBtn} disabled={busy !== null} title={t('btn.distill')} onClick={() => onDistill(row.sessionId)}>
@@ -876,6 +919,11 @@ function CurrentList(props: {
                               </div>
                             </div>
                             {child.running && <span style={S.badge}>{t('status.running')}</span>}
+                            {child.hostArchived === true && !child.running && (
+                              <span style={{ ...S.badge, background: 'transparent', border: `1px solid ${T.border}`, color: T.warn }} title={t('archive.restartHint')}>
+                                {t('badge.hostArchived')}
+                              </span>
+                            )}
                             <button
                               type="button"
                               style={S.iconBtn}
@@ -890,10 +938,10 @@ function CurrentList(props: {
                                 type="button"
                                 style={S.iconBtn}
                                 disabled={busy !== null}
-                                title={t('btn.archive')}
+                                title={child.hostArchived === true ? t('btn.finishArchive') : t('btn.archive')}
                                 onClick={() => onArchive(child.sessionId)}
                               >
-                                <IconArchive size={14} /> {t('btn.archive')}
+                                <IconArchive size={14} /> {child.hostArchived === true ? t('btn.finishArchive') : t('btn.archive')}
                               </button>
                             )}
                             <button type="button" style={S.iconBtn} disabled={busy !== null} title={t('btn.distill')} onClick={() => onDistill(child.sessionId)}>
@@ -991,6 +1039,14 @@ function ArchivedList(props: {
               {fmtSize(r.sizeBytes) !== '' ? ` · ${fmtSize(r.sizeBytes)}` : ''}
             </div>
           </div>
+          {r.pendingMove === true && (
+            <span
+              style={{ ...S.badge, background: 'transparent', border: `1px solid ${T.border}`, color: r.pendingReason === 'conflict' ? T.danger : T.warn }}
+              title={r.pendingDetail ?? t('archive.restartHint')}
+            >
+              {r.pendingReason === 'conflict' ? t('badge.conflict') : t('badge.pending')}
+            </span>
+          )}
           <button type="button" style={S.iconBtn} disabled={busy !== null} onClick={() => onOpenRestore(r.sessionId)}>
             {t('btn.openRestore')}
           </button>

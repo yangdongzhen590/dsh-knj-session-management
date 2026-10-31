@@ -3,9 +3,9 @@
  * which sessions have been moved into the archive root and where they live, so
  * restore can map them back to their original sessions tree location.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { zstdDecompressSync } from 'node:zlib'
+import { pickLogFile, readHeaderLine } from './fs.ts'
 import type { ArchiveRecord, ArchiveStoreFile } from './types.ts'
 
 const ARCHIVE_FILE = 'archive.json'
@@ -13,11 +13,12 @@ const ARCHIVE_FILE = 'archive.json'
 export class ArchiveStore {
   private records: ArchiveRecord[] = []
   private loaded = false
+  private readonly dataDir: string
+  private readonly archiveRoot: string
 
-  constructor(
-    private readonly dataDir: string,
-    private readonly archiveRoot: string,
-  ) {
+  constructor(dataDir: string, archiveRoot: string) {
+    this.dataDir = dataDir
+    this.archiveRoot = archiveRoot
     mkdirSync(dataDir, { recursive: true })
     mkdirSync(archiveRoot, { recursive: true })
   }
@@ -87,11 +88,20 @@ export class ArchiveStore {
     for (const record of this.records) {
       if (record.parentSessionId !== undefined) continue
       const dir = this.archiveDirOf(record)
-      const logPath = join(dir, 'session.jsonl')
-      const zstdPath = join(dir, 'session.jsonl.zstd')
-      const header = readArchiveHeader(existsSync(logPath) ? logPath : existsSync(zstdPath) ? zstdPath : undefined)
-      const parent = header?.['parentSession']
-      if (typeof parent === 'string' && parent !== '') {
+      let logName: string | undefined
+      try {
+        logName = pickLogFile(readdirSync(dir))
+      } catch {
+        continue
+      }
+      if (logName === undefined) continue
+      const header = readHeaderLine(join(dir, logName))
+      const parent = typeof header?.['parentSession'] === 'string'
+        ? (header['parentSession'] as string)
+        : typeof header?.['parentSessionId'] === 'string'
+          ? (header['parentSessionId'] as string)
+          : undefined
+      if (parent !== undefined && parent !== '') {
         record.parentSessionId = parent
         changed = true
       }
@@ -120,19 +130,4 @@ function isArchiveRecord(value: unknown): value is ArchiveRecord {
     r.dirName !== '' &&
     typeof r.archivedAt === 'number'
   )
-}
-
-/** Read the first (header) line of an archived session log, zstd-aware. */
-function readArchiveHeader(logPath: string | undefined): Record<string, unknown> | undefined {
-  if (logPath === undefined) return undefined
-  try {
-    const buf = readFileSync(logPath)
-    const text = logPath.endsWith('.zstd')
-      ? zstdDecompressSync(buf.subarray(0, Math.min(buf.length, 1 << 20))).toString('utf8')
-      : buf.toString('utf8')
-    const line = text.split('\n').find((l) => l.trim() !== '')
-    return line === undefined ? undefined : (JSON.parse(line) as Record<string, unknown>)
-  } catch {
-    return undefined
-  }
 }
