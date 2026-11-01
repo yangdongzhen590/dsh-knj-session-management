@@ -1,6 +1,6 @@
 {
   "name": "dsh-knj-session-management",
-  "version": "2026.11.9",
+  "version": "2026.11.10",
   "description": "Session management for DeepSeek Harness: archive/restore/delete persisted sessions, auto-policy per workspace, and a size governance panel. DSH 会话管理插件：归档/恢复/删除持久化会话，按工作区控制会话数量上限，提供体积治理面板。",
   "type": "module",
   "main": "lib/index.js",
@@ -8,7 +8,7 @@
   "license": "MIT",
   "engines": {
     "node": ">=20",
-    "dsh": ">=0.1.1-rc.2 <0.3.0-0"
+    "dsh": ">=0.1.1-rc.2 <0.1.2-0 || >=0.1.2-rc.1 <0.1.3-0 || >=0.1.3-rc.1 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0"
   },
   "dsh": {
     "bundle": {
@@ -43,8 +43,8 @@
   ],
   "peerDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
-    "@deepseek-ai/dsh-agent": ">=0.1.1-rc.2 <0.3.0-0",
-    "@deepseek-ai/dsh-session": ">=0.1.1-rc.2 <0.3.0-0"
+    "@deepseek-ai/dsh-agent": ">=0.1.1-rc.2 <0.1.2-0 || >=0.1.2-rc.1 <0.1.3-0 || >=0.1.3-rc.1 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0",
+    "@deepseek-ai/dsh-session": ">=0.1.1-rc.2 <0.1.2-0 || >=0.1.2-rc.1 <0.1.3-0 || >=0.1.3-rc.1 <0.2.0-0 || >=0.2.0-rc.1 <0.3.0-0"
   },
   "peerDependenciesMeta": {
     "@deepseek-ai/cordis": {
